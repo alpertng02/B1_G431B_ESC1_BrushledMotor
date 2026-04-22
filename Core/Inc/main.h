@@ -79,8 +79,6 @@ void Error_Handler(void);
 #define M1_PWM_WH_GPIO_Port GPIOA
 #define M1_PWM_VL_Pin GPIO_PIN_12
 #define M1_PWM_VL_GPIO_Port GPIOA
-#define PWM_INPUT_Pin GPIO_PIN_15
-#define PWM_INPUT_GPIO_Port GPIOA
 #define DEVBOARD_BUTTON_Pin GPIO_PIN_10
 #define DEVBOARD_BUTTON_GPIO_Port GPIOC
 
