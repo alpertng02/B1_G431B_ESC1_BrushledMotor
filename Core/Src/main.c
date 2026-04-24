@@ -24,6 +24,7 @@
 #include "dma.h"
 #include "fdcan.h"
 #include "opamp.h"
+#include "stm32g4xx_hal_tim.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -211,6 +212,8 @@ int main(void)
   // 4. Start Phase V (OUT2) PWM
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
 
   // Start PWM Input
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // Signal Input Channel (Main)
