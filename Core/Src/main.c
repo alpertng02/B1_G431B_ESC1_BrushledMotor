@@ -47,7 +47,7 @@
 /* USER CODE BEGIN PD */
 #define SYSCLK_FREQ (170e6)
 #define PWM_INPUT_MAX_PERIOD_MS (5)
-#define FAST_EMA_ALPHA (0.1f)
+#define CURRENT_LOWPASS_ALPHA (0.1f)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -320,16 +320,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     float inst_mA_u = (float)raw_u * 16.786f;
 
     // 2. Apply 20 kHz Software IIR Filter
-    current_u_filtered = (FAST_EMA_ALPHA * inst_mA_u) +
-                         ((1.0f - FAST_EMA_ALPHA) * current_u_filtered);
+    current_u_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_u) +
+                         ((1.0f - CURRENT_LOWPASS_ALPHA) * current_u_filtered);
   } else if (hadc->Instance == ADC2) {
     // 1. Calculate real mA for Phase V
     int32_t raw_v = (int32_t)phase_v_raw - offset_v;
     float inst_mA_v = (float)raw_v * 16.786f;
 
     // 2. Apply 20 kHz Software IIR Filter
-    current_v_filtered = (FAST_EMA_ALPHA * inst_mA_v) +
-                         ((1.0f - FAST_EMA_ALPHA) * current_v_filtered);
+    current_v_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_v) +
+                         ((1.0f - CURRENT_LOWPASS_ALPHA) * current_v_filtered);
   }
 }
 
