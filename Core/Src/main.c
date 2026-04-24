@@ -25,10 +25,10 @@
 #include "fdcan.h"
 #include "gpio.h"
 #include "opamp.h"
+#include "stm32g4xx_hal.h"
 #include "stm32g4xx_hal_tim.h"
 #include "tim.h"
 #include "usart.h"
-
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -77,6 +77,9 @@ volatile float current_v_filtered = 0.0f;
 
 // [0] Phase U Current, [1] Bus Voltage, [2] NTC Temperature, [3] Potentiometer
 volatile uint32_t adc1_buffer[4];
+
+volatile static int32_t offset_u = 2540;
+volatile static int32_t offset_v = 2540;
 
 volatile static uint64_t runtime_ms = 0;
 volatile static uint64_t last_pwm_input_ms = 0;
@@ -221,6 +224,23 @@ int main(void) {
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
 
+  HAL_Delay(10);
+
+  uint32_t sum_u = 0;
+  uint32_t sum_v = 0;
+  const int NUM_CAL_SAMPLES = 100;
+
+  for (int i = 0; i < NUM_CAL_SAMPLES; i++) {
+    // The DMA updates these variables automatically at 20kHz
+    sum_u += adc1_buffer[0];
+    sum_v += phase_v_raw;
+    HAL_Delay(1); // Wait 1ms between reads (collecting data over 100ms)
+  }
+
+  // Calculate the average offset
+  offset_u = sum_u / NUM_CAL_SAMPLES;
+  offset_v = sum_v / NUM_CAL_SAMPLES;
+
   // Start PWM Input
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // Signal Input Channel (Main)
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);    // Secondary Channel
@@ -296,17 +316,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
   if (hadc->Instance == ADC1) {
     // 1. Calculate real mA for Phase U
-    int32_t raw_u = adc1_buffer[0] - 2540;
+    int32_t raw_u = (int32_t)adc1_buffer[0] - offset_u;
     float inst_mA_u = (float)raw_u * 16.786f;
 
     // 2. Apply 20 kHz Software IIR Filter
     current_u_filtered = (FAST_EMA_ALPHA * inst_mA_u) +
                          ((1.0f - FAST_EMA_ALPHA) * current_u_filtered);
-  }
-
-  if (hadc->Instance == ADC2) {
+  } else if (hadc->Instance == ADC2) {
     // 1. Calculate real mA for Phase V
-    int32_t raw_v = phase_v_raw - 2540;
+    int32_t raw_v = (int32_t)phase_v_raw - offset_v;
     float inst_mA_v = (float)raw_v * 16.786f;
 
     // 2. Apply 20 kHz Software IIR Filter
@@ -328,6 +346,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     }
   }
 }
+
 /**
  * @brief  Period elapsed callback in non-blocking mode
  * @param  htim TIM handle
