@@ -30,6 +30,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -92,21 +93,21 @@ void SystemClock_Config(void);
 
 */
 
-void set_motor_speed(int8_t speed_percent) {
+void set_motor_speed(float speed_percent) {
 
   // Clamp the input to a safe max of 95% for the bootstrap capacitors
 
-  if (speed_percent > 95)
-    speed_percent = 95;
+  if (speed_percent > 98.0f)
+    speed_percent = 98.0f;
 
-  if (speed_percent < -95)
-    speed_percent = -95;
+  if (speed_percent < -98.0f)
+    speed_percent = -98.0f;
 
   // Get the current Auto-Reload Register (ARR) value
   const uint32_t arr_val = __HAL_TIM_GET_AUTORELOAD(&htim1);
-  const uint32_t ccr_val = (abs(speed_percent) * arr_val) / 100;
+  const uint32_t ccr_val = (uint32_t)((fabsf(speed_percent) * arr_val) / 100.0f);
 
-  if (speed_percent > 0) {
+  if (speed_percent > 2.0f) {
 
     // Forward: Drive OUT1, Coast OUT2
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_val);
@@ -114,7 +115,7 @@ void set_motor_speed(int8_t speed_percent) {
 
   }
 
-  else if (speed_percent < 0) {
+  else if (speed_percent < -2.0f) {
     // Reverse: Coast OUT1, Drive OUT2
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_val);
