@@ -21,18 +21,12 @@
 #include "adc.h"
 #include "comp.h"
 #include "dac.h"
+#include "dma.h"
 #include "fdcan.h"
-#include "gpio.h"
 #include "opamp.h"
-#include "stm32g431xx.h"
-#include "stm32g4xx_hal.h"
-#include "stm32g4xx_hal_def.h"
-#include "stm32g4xx_hal_gpio.h"
-#include "stm32g4xx_hal_rcc.h"
-#include "stm32g4xx_hal_uart.h"
-#include "system_stm32g4xx.h"
 #include "tim.h"
 #include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -70,6 +64,12 @@ volatile static float pwm_input_duty = 0.0;
 
 volatile static bool pot_mode_enabled = false;
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
+
+volatile static uint32_t phase_u_raw = 0;
+volatile static uint32_t phase_v_raw = 0;
+
+// [0] Phase U Current, [1] Bus Voltage, [2] NTC Temperature, [3] Potentiometer
+volatile uint32_t adc1_buffer[4];
 
 volatile static uint64_t runtime_ms = 0;
 volatile static uint64_t last_pwm_input_ms = 0;
@@ -146,10 +146,11 @@ void ADC_Select_Channel(ADC_HandleTypeDef *hadc, uint32_t channel) {
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
 
@@ -157,8 +158,7 @@ int main(void) {
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -174,6 +174,7 @@ int main(void) {
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_COMP1_Init();
@@ -197,6 +198,10 @@ int main(void) {
   // 2. Calibrate the ADCs (CRITICAL for STM32G4!)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+
+  // Start ADCs in Hardware-Triggered Interrupt Mode
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc1_buffer, 4);
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)&phase_v_raw, 1);
 
   // 3. Start Phase U (OUT1) PWM
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -234,20 +239,21 @@ int main(void) {
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -257,25 +263,28 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
     Error_Handler();
   }
 }
 
 /* USER CODE BEGIN 4 */
+
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM2) {
     uint32_t cl = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
@@ -294,69 +303,36 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
  * @param  htim TIM handle
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-
   if (htim->Instance == TIM6) {
     runtime_ms++;
 
     if (pot_mode_enabled) {
-      // ---------------------------------------------------------
-      // 1. READ POTENTIOMETER & SET SPEED
-      // ---------------------------------------------------------
-      // Explicitly select Channel 11 (Potentiometer) on ADC1
-      ADC_Select_Channel(&hadc1, ADC_CHANNEL_11);
-      HAL_ADC_Start(&hadc1);
-
-      if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK) {
-        uint32_t adc_val = HAL_ADC_GetValue(&hadc1);
-
-        target_speed = ((adc_val * 200) / 4095) - 100;
-        if (target_speed > -5 && target_speed < 5) {
-          target_speed = 0;
-        }
-      }
+      // DMA constantly updates adc1_buffer
+      uint32_t adc_val = adc1_buffer[3]; 
+      target_speed = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
+      if (target_speed > -5 && target_speed < 5) target_speed = 0;
     } else {
-
       if (runtime_ms - last_pwm_input_ms > PWM_INPUT_MAX_PERIOD_MS) {
         pwm_input_duty = 0.0f;
-        pwm_input_frequency = 0.0f;
+        pwm_input_frequency = 0;
       }
-
-      target_speed = pwm_input_duty;
+      target_speed = pwm_input_duty; // Assuming mapping is fixed!
     }
+    
     set_motor_speed(target_speed);
 
-    // ---------------------------------------------------------
-    // 2. READ THE CORRECT CURRENT SHUNT BASED ON DIRECTION
-    // ---------------------------------------------------------
+    // Get current based on direction
     if (target_speed > 0) {
-      // FORWARD: Current goes to ground via Phase V (ADC2 / OPAMP2)
-      HAL_ADC_Start(&hadc2);
-      if (HAL_ADC_PollForConversion(&hadc2, 1) == HAL_OK) {
-        uint32_t adc2_raw = HAL_ADC_GetValue(&hadc2);
-
-        current_raw = adc2_raw - 2540; // Use your Phase V offset
-        // if (current_raw < 0) current_raw = 0; // Prevent noise from showing
-        // negative
-
-        current_mA = (float)(current_raw) * 16.786f;
-      }
-    } else if (target_speed < 0) {
-      // REVERSE: Current goes to ground via Phase U (ADC1 / OPAMP1)
-      // Switch ADC1 to read OPAMP1 (Channel 3)
-      ADC_Select_Channel(&hadc1, ADC_CHANNEL_3);
-      HAL_ADC_Start(&hadc1);
-
-      if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK) {
-        uint32_t adc1_raw = HAL_ADC_GetValue(&hadc1);
-
-        current_raw = adc1_raw - 2540; // NOTE: Phase U might have a slightly
-                                       // different offset than Phase V!
-                                       // if (current_raw < 0) current_raw = 0;
-
-        current_mA = (float)(current_raw) * 16.786f;
-      }
-    } else {
-      // COAST/STOPPED
+      // Forward: Phase V. DMA constantly updates phase_v_raw
+      current_raw = phase_v_raw - 2540; 
+      current_mA = (float)(current_raw) * 16.786f;
+    } 
+    else if (target_speed < 0) {
+      // Reverse: Phase U. DMA constantly updates adc1_buffer[0]
+      current_raw = adc1_buffer[0] - 2540; 
+      current_mA = (float)(current_raw) * 16.786f;
+    } 
+    else {
       current_raw = 0;
       current_mA = 0.0f;
     }
@@ -365,10 +341,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state
    */
@@ -379,13 +356,14 @@ void Error_Handler(void) {
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
