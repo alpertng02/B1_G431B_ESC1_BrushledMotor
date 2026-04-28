@@ -23,10 +23,10 @@
 #include "dac.h"
 #include "dma.h"
 #include "fdcan.h"
+#include "gpio.h"
 #include "opamp.h"
 #include "tim.h"
 #include "usart.h"
-#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +46,9 @@
 #define SYSCLK_FREQ (170e6)
 #define PWM_INPUT_MAX_PERIOD_MS (5)
 #define CURRENT_LOWPASS_ALPHA (0.1f)
+#define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
+#define DAC_AMP_TO_BITS_RATIO (59.5f)
+#define OVERCURRENT_PROTECTION_TIMEOUT_MS (2000)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -64,6 +67,7 @@ volatile static uint32_t pwm_input_frequency = 0;
 volatile static uint32_t pwm_input_cycletime = 0;
 volatile static float pwm_input_duty = 0.0;
 
+volatile bool hardware_fault_triggered = false;
 volatile static bool pot_mode_enabled = false;
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
 
@@ -81,6 +85,7 @@ volatile static int32_t offset_v = 2540;
 
 volatile static uint64_t runtime_ms = 0;
 volatile static uint64_t last_pwm_input_ms = 0;
+volatile static uint64_t fault_timestamp_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -155,11 +160,10 @@ void ADC_Select_Channel(ADC_HandleTypeDef *hadc, uint32_t channel) {
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
 
@@ -167,7 +171,8 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -239,6 +244,36 @@ int main(void)
   offset_u = sum_u / NUM_CAL_SAMPLES;
   offset_v = sum_v / NUM_CAL_SAMPLES;
 
+  // ==========================================================
+  // --- HARDWARE OVERCURRENT PROTECTION SETUP ---
+  // ==========================================================
+  // 1 Amp = ~59.5 raw units. For 20A trip limit: 20 * 59.5 = 1190
+  const uint32_t TRIP_DELTA =
+      (uint32_t)(OVERCURRENT_PROTECTION_THRESHOLD_AMPS * DAC_AMP_TO_BITS_RATIO);
+
+  uint32_t trip_limit_u = offset_u + TRIP_DELTA;
+  uint32_t trip_limit_v = offset_v + TRIP_DELTA;
+
+  // Clamp limits to maximum 12-bit value (4095) just in case
+  if (trip_limit_u > 4095)
+    trip_limit_u = 4095;
+  if (trip_limit_v > 4095)
+    trip_limit_v = 4095;
+
+  // 1. Set the DAC thresholds
+  // DAC CH1 feeds COMP1 (Phase U), DAC CH2 feeds COMP2 (Phase V)
+  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_1, DAC_ALIGN_12B_R, trip_limit_u);
+  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_2, DAC_ALIGN_12B_R, trip_limit_v);
+
+  // 2. Start the DAC
+  HAL_DAC_Start(&hdac3, DAC_CHANNEL_1);
+  HAL_DAC_Start(&hdac3, DAC_CHANNEL_2);
+
+  // 3. Start the Comparators to watch the OPAMPs
+  HAL_COMP_Start(&hcomp1);
+  HAL_COMP_Start(&hcomp2);
+  // ==========================================================
+
   // Start PWM Input
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // Signal Input Channel (Main)
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);    // Secondary Channel
@@ -267,21 +302,20 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-  */
+   */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+   * in the RCC_OscInitTypeDef structure.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -291,27 +325,34 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
     Error_Handler();
   }
 }
 
 /* USER CODE BEGIN 4 */
+
+// This automatically fires if COMP1 or COMP2 trips TIM1
+void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance == TIM1) {
+    hardware_fault_triggered = true;
+    target_speed = 0.0f;
+    fault_timestamp_ms = runtime_ms;
+  }
+}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
@@ -356,7 +397,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
     runtime_ms++;
 
-    if (pot_mode_enabled) {
+    if (hardware_fault_triggered) {
+      target_speed = 0.0f;
+
+      // Wait for the timeout
+      if ((runtime_ms - fault_timestamp_ms) >= OVERCURRENT_PROTECTION_TIMEOUT_MS) {
+
+        float pending_throttle = 0.0f;
+        if (pot_mode_enabled) {
+          uint32_t adc_val = adc1_buffer[3];
+          pending_throttle = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
+        } else {
+          pending_throttle = pwm_input_duty;
+        }
+
+        // Only re-arm if the throttle is in the neutral deadzone
+        if (pending_throttle > -5.0f && pending_throttle < 5.0f) {
+          hardware_fault_triggered = false;
+          __HAL_TIM_MOE_ENABLE(&htim1); // Re-enable the pwm output
+        }
+      }
+
+    } else if (pot_mode_enabled) {
       // DMA constantly updates adc1_buffer
       uint32_t adc_val = adc1_buffer[3];
       target_speed = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
@@ -387,11 +449,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state
    */
@@ -402,14 +463,13 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
