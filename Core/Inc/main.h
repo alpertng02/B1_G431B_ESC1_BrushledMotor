@@ -59,6 +59,8 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define M1_PWM_UL_Pin GPIO_PIN_13
 #define M1_PWM_UL_GPIO_Port GPIOC
+#define CAN_TERMINATION_Pin GPIO_PIN_14
+#define CAN_TERMINATION_GPIO_Port GPIOC
 #define M1_BUS_VOLTAGE_Pin GPIO_PIN_0
 #define M1_BUS_VOLTAGE_GPIO_Port GPIOA
 #define M1_OPAMP1_OUT_Pin GPIO_PIN_2
