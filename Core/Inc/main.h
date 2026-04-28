@@ -83,6 +83,8 @@ void Error_Handler(void);
 #define M1_PWM_VL_GPIO_Port GPIOA
 #define DEVBOARD_BUTTON_Pin GPIO_PIN_10
 #define DEVBOARD_BUTTON_GPIO_Port GPIOC
+#define CAN_TRANSCEIVER_SHUTDOWN_Pin GPIO_PIN_11
+#define CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 

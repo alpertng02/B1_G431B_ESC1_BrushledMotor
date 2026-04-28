@@ -28,7 +28,6 @@
 #include "tim.h"
 #include "usart.h"
 
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
@@ -51,6 +50,7 @@
 #define BUS_VOLTAGE_DIVIDER_RATIO (17.9f)
 
 #define CANBUS_TERMINATION_RESISTOR_ACTIVE (0)
+#define CANBUS_TRANSCEIVER_ACTIVE (1)
 
 #define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
 #define DAC_AMP_TO_BITS_RATIO (59.5f)
@@ -212,6 +212,10 @@ int main(void) {
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+
+  // Enable or disable the
+  HAL_GPIO_WritePin(CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port,
+                    CAN_TRANSCEIVER_SHUTDOWN_Pin, !CANBUS_TRANSCEIVER_ACTIVE);
 
   // Enable or disable the CAN termination resistor according to config
   HAL_GPIO_WritePin(CAN_TERMINATION_GPIO_Port, CAN_TERMINATION_Pin,
@@ -409,10 +413,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
     runtime_ms++;
 
-    bus_voltage_v = (float)adc1_buffer[1] *
-                    (BUS_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095)
+    bus_voltage_v =
+        (float)adc1_buffer[1] * (BUS_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095);
 
-                        if (hardware_fault_triggered) {
+    if (hardware_fault_triggered) {
       target_speed = 0.0f;
 
       // Wait for the timeout
@@ -433,15 +437,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
           __HAL_TIM_MOE_ENABLE(&htim1); // Re-enable the pwm output
         }
       }
-    }
-    else if (pot_mode_enabled) {
+    } else if (pot_mode_enabled) {
       // DMA constantly updates adc1_buffer
       uint32_t adc_val = adc1_buffer[3];
       target_speed = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
       if (target_speed > -5 && target_speed < 5)
         target_speed = 0;
-    }
-    else {
+    } else {
       if (runtime_ms - last_pwm_input_ms > PWM_INPUT_MAX_PERIOD_MS) {
         pwm_input_duty = 0.0f;
         pwm_input_frequency = 0;
