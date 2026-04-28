@@ -28,6 +28,7 @@
 #include "tim.h"
 #include "usart.h"
 
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
@@ -48,9 +49,20 @@
 #define CURRENT_LOWPASS_ALPHA (0.1f)
 
 #define BUS_VOLTAGE_DIVIDER_RATIO (17.9f)
+#define BEMF_VOLTAGE_DIVIDER_RATIO (8.02f)
 
 #define CANBUS_TERMINATION_RESISTOR_ACTIVE (0)
 #define CANBUS_TRANSCEIVER_ACTIVE (1)
+
+#define CELL_VOLTAGE_LOW (3.0f)
+#define CELL_VOLTAGE_HIGH (4.2f)
+
+#define BATTERY_CELL_COUNT (6)
+
+#define OVERVOLTAGE_RATE_ALLOWED (1.2f)
+#define UNDERVOLTAGE_RATE_ALLOWED (1.0f)
+
+#define OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS (80.0f)
 
 #define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
 #define DAC_AMP_TO_BITS_RATIO (59.5f)
@@ -85,11 +97,23 @@ volatile static uint32_t phase_v_raw = 0;
 volatile float current_u_filtered = 0.0f;
 volatile float current_v_filtered = 0.0f;
 
+volatile static float bemf_u_V = 0.0f;
+volatile static float bemf_v_V = 0.0f;
+volatile static float bemf_w_V = 0.0f;
+
 // [0] Phase U Current, [1] Bus Voltage, [2] NTC Temperature, [3] Potentiometer
 volatile uint32_t adc1_buffer[4];
+// [0] Phase V Current, [1] BEMF_U, [2] BEMF_V, [3] BEMF_W
+volatile uint32_t adc2_buffer[4];
 
 volatile static int32_t offset_u = 2540;
 volatile static int32_t offset_v = 2540;
+
+volatile static float board_temp_C = 0.0f;
+
+volatile static bool voltage_protection_on = true;
+volatile static bool temperature_protection_on = true;
+volatile static bool overcurrent_protection_on = true;
 
 volatile static uint64_t runtime_ms = 0;
 volatile static uint64_t last_pwm_input_ms = 0;
@@ -100,70 +124,18 @@ volatile static uint64_t fault_timestamp_ms = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 
+void set_motor_speed(float speed_percent);
+
+float get_ntc_temperature_c(uint32_t adc_val);
+float get_bus_voltage(uint32_t adc_val);
+float get_shunt_resistor_current(uint32_t adc_val, uint32_t offset);
+float get_potentiometer_target_speed(uint32_t adc_val);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/**
 
-* @brief Drives the brushed DC motor on OUT1 and OUT2
-
-* @param speed_percent: -100 to 100 (Negative for reverse, Positive for forward,
-0 to coast)
-
-*/
-
-void set_motor_speed(float speed_percent) {
-
-  // Clamp the input to a safe max of 95% for the bootstrap capacitors
-
-  if (speed_percent > 98.0f)
-    speed_percent = 98.0f;
-
-  if (speed_percent < -98.0f)
-    speed_percent = -98.0f;
-
-  // Get the current Auto-Reload Register (ARR) value
-  const uint32_t arr_val = __HAL_TIM_GET_AUTORELOAD(&htim1);
-  const uint32_t ccr_val =
-      (uint32_t)((fabsf(speed_percent) * arr_val) / 100.0f);
-
-  if (speed_percent > 2.0f) {
-
-    // Forward: Drive OUT1, Coast OUT2
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_val);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-
-  }
-
-  else if (speed_percent < -2.0f) {
-    // Reverse: Coast OUT1, Drive OUT2
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_val);
-  }
-
-  else {
-    // Coast: Both low
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-  }
-}
-
-void ADC_Select_Channel(ADC_HandleTypeDef *hadc, uint32_t channel) {
-  // 1. Force the ADC to stop any ongoing background processes
-  HAL_ADC_Stop(hadc);
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-  sConfig.Channel = channel;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
-  sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.OffsetNumber = ADC_OFFSET_NONE;
-  sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(hadc, &sConfig) != HAL_OK) {
-    Error_Handler();
-  }
-}
 
 /* USER CODE END 0 */
 
@@ -231,7 +203,7 @@ int main(void) {
 
   // Start ADCs in Hardware-Triggered Interrupt Mode
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc1_buffer, 4);
-  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)&phase_v_raw, 1);
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)adc2_buffer, 4);
 
   // 3. Start Phase U (OUT1) PWM
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -252,7 +224,7 @@ int main(void) {
   for (int i = 0; i < NUM_CAL_SAMPLES; i++) {
     // The DMA updates these variables automatically at 20kHz
     sum_u += adc1_buffer[0];
-    sum_v += phase_v_raw;
+    sum_v += adc2_buffer[0];
     HAL_Delay(1); // Wait 1ms between reads (collecting data over 100ms)
   }
 
@@ -374,16 +346,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
   if (hadc->Instance == ADC1) {
     // 1. Calculate real mA for Phase U
-    int32_t raw_u = (int32_t)adc1_buffer[0] - offset_u;
-    float inst_mA_u = (float)raw_u * 16.786f;
+    float inst_mA_u = get_shunt_resistor_current(adc1_buffer[0], offset_u);
 
     // 2. Apply 20 kHz Software IIR Filter
     current_u_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_u) +
                          ((1.0f - CURRENT_LOWPASS_ALPHA) * current_u_filtered);
   } else if (hadc->Instance == ADC2) {
     // 1. Calculate real mA for Phase V
-    int32_t raw_v = (int32_t)phase_v_raw - offset_v;
-    float inst_mA_v = (float)raw_v * 16.786f;
+    float inst_mA_v = get_shunt_resistor_current(adc2_buffer[0], offset_v);
 
     // 2. Apply 20 kHz Software IIR Filter
     current_v_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_v) +
@@ -413,8 +383,39 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
     runtime_ms++;
 
-    bus_voltage_v =
-        (float)adc1_buffer[1] * (BUS_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095);
+    // Read battery voltages
+    bus_voltage_v = get_bus_voltage(adc1_buffer[1]);
+
+    // Over/Undervoltage Protection
+    if (voltage_protection_on) {
+      if (bus_voltage_v < BATTERY_CELL_COUNT * CELL_VOLTAGE_LOW *
+                              UNDERVOLTAGE_RATE_ALLOWED ||
+          bus_voltage_v > BATTERY_CELL_COUNT * CELL_VOLTAGE_HIGH *
+                              OVERVOLTAGE_RATE_ALLOWED) {
+        hardware_fault_triggered = true;
+        fault_timestamp_ms = runtime_ms;
+      }
+    }
+
+    bemf_u_V =
+        (float)adc2_buffer[1] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+    bemf_v_V =
+        (float)adc2_buffer[2] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+    bemf_w_V =
+        (float)adc2_buffer[3] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+
+    board_temp_C = get_ntc_temperature_c(adc1_buffer[2]);
+
+    // Over-Temperature Protection
+    if (temperature_protection_on) {
+      if (board_temp_C > OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS) {
+        hardware_fault_triggered = true;
+        fault_timestamp_ms = runtime_ms;
+      }
+    }
+
+    HAL_GPIO_WritePin(DEVBOARD_LED_GPIO_Port, DEVBOARD_LED_Pin,
+                      hardware_fault_triggered);
 
     if (hardware_fault_triggered) {
       target_speed = 0.0f;
@@ -425,8 +426,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
         float pending_throttle = 0.0f;
         if (pot_mode_enabled) {
-          uint32_t adc_val = adc1_buffer[3];
-          pending_throttle = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
+          pending_throttle = get_potentiometer_target_speed(adc1_buffer[3]);
         } else {
           pending_throttle = pwm_input_duty;
         }
@@ -439,10 +439,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       }
     } else if (pot_mode_enabled) {
       // DMA constantly updates adc1_buffer
-      uint32_t adc_val = adc1_buffer[3];
-      target_speed = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
-      if (target_speed > -5 && target_speed < 5)
-        target_speed = 0;
+      target_speed = get_potentiometer_target_speed(adc1_buffer[3]);
     } else {
       if (runtime_ms - last_pwm_input_ms > PWM_INPUT_MAX_PERIOD_MS) {
         pwm_input_duty = 0.0f;
@@ -465,6 +462,83 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
   }
 }
+
+/**
+* @brief Drives the brushed DC motor on OUT1 and OUT2
+
+* @param speed_percent: -100 to 100 (Negative for reverse, Positive for forward,
+0 to coast)
+*/
+void set_motor_speed(float speed_percent) {
+
+  // Clamp the input to a safe max of 95% for the bootstrap capacitors
+  if (speed_percent > 98.0f)
+    speed_percent = 98.0f;
+
+  if (speed_percent < -98.0f)
+    speed_percent = -98.0f;
+
+  // Get the current Auto-Reload Register (ARR) value
+  const uint32_t arr_val = __HAL_TIM_GET_AUTORELOAD(&htim1);
+  const uint32_t ccr_val =
+      (uint32_t)((fabsf(speed_percent) * arr_val) / 100.0f);
+
+  if (speed_percent > 2.0f) {
+
+    // Forward: Drive OUT1, Coast OUT2
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_val);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+
+  }
+
+  else if (speed_percent < -2.0f) {
+    // Reverse: Coast OUT1, Drive OUT2
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_val);
+  }
+
+  else {
+    // Coast: Both low
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+  }
+}
+
+float get_ntc_temperature_c(uint32_t adc_val) {
+  // Calculate NTC Resistance. The B-G431B-ESC1 uses a 4.7k pull-up resistor
+  // to 3.3V
+  float ntc_voltage = (float)adc_val * (3.3f / 4095.0f);
+  float ntc_resistance = (4700.0f * ntc_voltage) / (3.3f - ntc_voltage);
+
+  // Beta Equation for Temperature (Beta = ~3380 for this NTC)
+  // T = 1 / ( (1/T0) + (1/B)*ln(R/R0) )
+  float temp_kelvin =
+      1.0f /
+      ((1.0f / 298.15f) + (1.0f / 3380.0f) * logf(ntc_resistance / 10000.0f));
+  float temp_C = temp_kelvin - 273.15f;
+  return temp_C;
+}
+
+float get_bus_voltage(uint32_t adc_val) {
+  float bus_voltage =
+      (float)adc_val * (BUS_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095);
+  return bus_voltage;
+}
+
+float get_shunt_resistor_current(uint32_t adc_val, uint32_t offset) {
+  int32_t raw_val = (int32_t)adc_val - offset;
+  float inst_mA = (float)raw_val * 16.786f;
+
+  return inst_mA;
+}
+
+float get_potentiometer_target_speed(uint32_t adc_val) {
+  float target = ((adc_val * 200.0f) / 4095.0f) - 100.0f;
+  if (target > -5 && target < 5)
+    target = 0;
+  return target;
+}
+
 /* USER CODE END 4 */
 
 /**

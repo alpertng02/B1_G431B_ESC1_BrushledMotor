@@ -132,7 +132,7 @@ void HAL_OPAMP_MspInit(OPAMP_HandleTypeDef* opampHandle)
     PA2     ------> OPAMP1_VOUT
     PA3     ------> OPAMP1_VINM0
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_1|M1_OPAMP1_OUT_Pin|M1_OPAMP1_INT_GAIN_Pin;
+    GPIO_InitStruct.Pin = GPIO_PIN_1|SHUNT_U_Pin|M1_OPAMP1_INT_GAIN_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -153,7 +153,7 @@ void HAL_OPAMP_MspInit(OPAMP_HandleTypeDef* opampHandle)
     PA6     ------> OPAMP2_VOUT
     PA7     ------> OPAMP2_VINP
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+    GPIO_InitStruct.Pin = GPIO_PIN_5|SHUNT_V_Pin|GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -174,7 +174,7 @@ void HAL_OPAMP_MspInit(OPAMP_HandleTypeDef* opampHandle)
     PB1     ------> OPAMP3_VOUT
     PB2     ------> OPAMP3_VINM0
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_0|M1_OPAMP3_OUT_Pin|GPIO_PIN_2;
+    GPIO_InitStruct.Pin = GPIO_PIN_0|SHUNT_W_Pin|GPIO_PIN_2;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
@@ -199,7 +199,7 @@ void HAL_OPAMP_MspDeInit(OPAMP_HandleTypeDef* opampHandle)
     PA2     ------> OPAMP1_VOUT
     PA3     ------> OPAMP1_VINM0
     */
-    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_1|M1_OPAMP1_OUT_Pin|M1_OPAMP1_INT_GAIN_Pin);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_1|SHUNT_U_Pin|M1_OPAMP1_INT_GAIN_Pin);
 
   /* USER CODE BEGIN OPAMP1_MspDeInit 1 */
 
@@ -216,7 +216,7 @@ void HAL_OPAMP_MspDeInit(OPAMP_HandleTypeDef* opampHandle)
     PA6     ------> OPAMP2_VOUT
     PA7     ------> OPAMP2_VINP
     */
-    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_5|SHUNT_V_Pin|GPIO_PIN_7);
 
   /* USER CODE BEGIN OPAMP2_MspDeInit 1 */
 
@@ -233,7 +233,7 @@ void HAL_OPAMP_MspDeInit(OPAMP_HandleTypeDef* opampHandle)
     PB1     ------> OPAMP3_VOUT
     PB2     ------> OPAMP3_VINM0
     */
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0|M1_OPAMP3_OUT_Pin|GPIO_PIN_2);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0|SHUNT_W_Pin|GPIO_PIN_2);
 
   /* USER CODE BEGIN OPAMP3_MspDeInit 1 */
 
