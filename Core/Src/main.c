@@ -24,8 +24,8 @@
 #include "dma.h"
 #include "fdcan.h"
 #include "opamp.h"
+#include "stm32g4xx_hal_gpio.h"
 #include "tim.h"
-#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -196,7 +196,6 @@ int main(void)
   MX_OPAMP3_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
-  MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
@@ -367,7 +366,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         pwm_input_duty = 0.0f;
         pwm_input_frequency = 0;
       }
-      target_speed = pwm_input_duty; // Assuming mapping is fixed!
+      target_speed = pwm_input_duty;
+      if (HAL_GPIO_ReadPin(DIR_INPUT_GPIO_Port, DIR_INPUT_Pin) ==
+          GPIO_PIN_RESET) {
+        target_speed = -target_speed;
+      }
     }
 
     set_motor_speed(target_speed);

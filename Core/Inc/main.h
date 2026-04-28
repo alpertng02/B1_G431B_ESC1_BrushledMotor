@@ -81,6 +81,8 @@ void Error_Handler(void);
 #define M1_PWM_VL_GPIO_Port GPIOA
 #define DEVBOARD_BUTTON_Pin GPIO_PIN_10
 #define DEVBOARD_BUTTON_GPIO_Port GPIOC
+#define DIR_INPUT_Pin GPIO_PIN_4
+#define DIR_INPUT_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
