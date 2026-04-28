@@ -53,12 +53,32 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, CAN_TERMINATION_Pin|DEVBOARD_LED_Pin|CAN_TRANSCEIVER_SHUTDOWN_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(M1_PWM_WL_DISABLED_GPIO_Port, M1_PWM_WL_DISABLED_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(M1_PWM_WH_DISABLED_GPIO_Port, M1_PWM_WH_DISABLED_Pin, GPIO_PIN_RESET);
+
   /*Configure GPIO pins : CAN_TERMINATION_Pin DEVBOARD_LED_Pin CAN_TRANSCEIVER_SHUTDOWN_Pin */
   GPIO_InitStruct.Pin = CAN_TERMINATION_Pin|DEVBOARD_LED_Pin|CAN_TRANSCEIVER_SHUTDOWN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : M1_PWM_WL_DISABLED_Pin */
+  GPIO_InitStruct.Pin = M1_PWM_WL_DISABLED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(M1_PWM_WL_DISABLED_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : M1_PWM_WH_DISABLED_Pin */
+  GPIO_InitStruct.Pin = M1_PWM_WH_DISABLED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(M1_PWM_WH_DISABLED_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : DEVBOARD_BUTTON_Pin */
   GPIO_InitStruct.Pin = DEVBOARD_BUTTON_Pin;
