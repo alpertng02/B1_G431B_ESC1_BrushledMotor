@@ -45,11 +45,11 @@
 /* USER CODE BEGIN PD */
 #define SYSCLK_FREQ (170e6)
 
-#define PWM_INPUT_MAX_PERIOD_MS (20)
+#define PWM_INPUT_MAX_PERIOD_MS (50)
 #define PWM_INPUT_MIN_US (1000.0f)
 #define PWM_INPUT_MAX_US (2000.0f)
 #define PWM_INPUT_CENTER_US (1500.0f)
-#define PWM_INPUT_DEADZONE_US (50.0f)
+#define PWM_INPUT_DEADZONE_US (20.0f)
 
 #define CURRENT_LOWPASS_ALPHA (0.1f)
 
@@ -471,7 +471,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 */
 void set_motor_speed(float speed_percent) {
 
-  // Clamp the input to a safe max of 95% for the bootstrap capacitors
+  // Clamp the input to a safe max for the bootstrap capacitors
   if (speed_percent > 98.0f)
     speed_percent = 98.0f;
 
@@ -484,11 +484,9 @@ void set_motor_speed(float speed_percent) {
       (uint32_t)((fabsf(speed_percent) * arr_val) / 100.0f);
 
   if (speed_percent > 2.0f) {
-
     // Forward: Drive OUT1, Coast OUT2
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_val);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-
   }
 
   else if (speed_percent < -2.0f) {
@@ -544,16 +542,22 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks) {
   float target = 0.0f;
 
   if (pulse_width_us > PWM_INPUT_CENTER_US + PWM_INPUT_DEADZONE_US;) {
-    target = ((pulse_width_us - PWM_INPUT_CENTER_US) / (PWM_INPUT_MAX_US - PWM_INPUT_CENTER_US)) * 100.0f;
-  } 
+    target = ((pulse_width_us - PWM_INPUT_CENTER_US) /
+              (PWM_INPUT_MAX_US - PWM_INPUT_CENTER_US)) *
+             100.0f;
+  }
   // Reverse (1450us down to 1000us) -> Maps to 0% to -100%
-  else if (pulse_width_us <  PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
-    target = ((PWM_INPUT_CENTER_US - pulse_width_us) / (PWM_INPUT_CENTER_US - PWM_INPUT_MIN_US)) * -100.0f;
+  else if (pulse_width_us < PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
+    target = ((PWM_INPUT_CENTER_US - pulse_width_us) /
+              (PWM_INPUT_CENTER_US - PWM_INPUT_MIN_US)) *
+             -100.0f;
   }
 
   // Clamp limits to perfectly protect the PWM outputs
-  if (target > 100.0f) target = 100.0f;
-  if (target < -100.0f) target = -100.0f;
+  if (target > 100.0f)
+    target = 100.0f;
+  if (target < -100.0f)
+    target = -100.0f;
 
   return target;
 }
