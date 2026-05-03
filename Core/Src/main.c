@@ -25,6 +25,7 @@
 #include "fdcan.h"
 #include "gpio.h"
 #include "opamp.h"
+#include "stm32g4xx_hal_tim.h"
 #include "tim.h"
 #include "usart.h"
 
@@ -38,6 +39,17 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t header;      // 2 Bytes (0xAA55)
+  float target_speed;   // 4 Bytes (-100.0 to 100.0)
+  uint8_t enable_motor; // 1 Byte  (1 = Run, 0 = Stop)
+  uint8_t padding[3];   // 3 Bytes (Forces struct to exactly 12 bytes for FDCAN
+                        // alignment)
+  uint16_t footer;      // 2 Bytes (0x55AA)
+} ControlPacket;        // Total = 12 Bytes
+#pragma pack(pop)
 
 /* USER CODE END PTD */
 
@@ -69,11 +81,17 @@
 
 #define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
 #define DAC_AMP_TO_BITS_RATIO (59.5f)
+
 #define OVERCURRENT_PROTECTION_TIMEOUT_MS (2000)
+#define OVERTEMPERATURE_PROTECTION_TIMEOUT_MS (5000)
+#define VOLTAGE_PROTECTION_TIMEOUT_MS (2000)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MAX3(a, b, c) MAX(MAX(a, b), c)
 
 /* USER CODE END PM */
 
@@ -85,10 +103,6 @@ volatile static float current_mA = 0;
 volatile static float target_speed = 0; // Changes from -100.0 to +100.0
 
 volatile static float pwm_input_target_duty = 0.0;
-
-volatile bool hardware_fault_triggered = false;
-volatile static bool pot_mode_enabled = false;
-static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
 
 volatile static float bus_voltage_v = 0.0f;
 
@@ -117,8 +131,20 @@ volatile static bool voltage_protection_on = true;
 volatile static bool temperature_protection_on = true;
 volatile static bool overcurrent_protection_on = true;
 
+volatile bool overcurrent_fault_triggered = false;
+volatile bool overtemperature_fault_triggered = false;
+volatile bool voltage_fault_triggered = false;
+
+volatile bool hardware_fault_triggered = false;
+volatile static bool pot_mode_enabled = false;
+static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
+
 volatile static uint64_t runtime_ms = 0;
 volatile static uint64_t last_pwm_input_ms = 0;
+
+volatile static uint64_t overcurrent_fault_timestamp_ms = 0;
+volatile static uint64_t voltage_fault_timestamp_ms = 0;
+volatile static uint64_t overtemperature_fault_timestamp_ms = 0;
 volatile static uint64_t fault_timestamp_ms = 0;
 /* USER CODE END PV */
 
@@ -339,9 +365,9 @@ void SystemClock_Config(void) {
 // This automatically fires if COMP1 or COMP2 trips TIM1
 void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM1) {
-    hardware_fault_triggered = true;
+    overcurrent_fault_triggered = true;
+    overcurrent_fault_timestamp_ms = runtime_ms;
     target_speed = 0.0f;
-    fault_timestamp_ms = runtime_ms;
   }
 }
 
@@ -393,8 +419,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
                               UNDERVOLTAGE_RATE_ALLOWED ||
           bus_voltage_v > battery_cell_count * CELL_VOLTAGE_HIGH *
                               OVERVOLTAGE_RATE_ALLOWED) {
-        hardware_fault_triggered = true;
-        fault_timestamp_ms = runtime_ms;
+        voltage_fault_triggered = true;
+        voltage_fault_timestamp_ms = runtime_ms;
+      } else {
+        if (runtime_ms - voltage_fault_timestamp_ms >
+            VOLTAGE_PROTECTION_TIMEOUT_MS) {
+          voltage_fault_triggered = false;
+        }
       }
     }
 
@@ -406,25 +437,39 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         (float)adc2_buffer[3] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
 
     board_temp_C = get_ntc_temperature_c(adc1_buffer[2]);
-
     // Over-Temperature Protection
     if (temperature_protection_on) {
       if (board_temp_C > OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS) {
-        hardware_fault_triggered = true;
-        fault_timestamp_ms = runtime_ms;
+        overtemperature_fault_triggered = true;
+        overtemperature_fault_timestamp_ms = runtime_ms;
+      } else {
+        if (runtime_ms - overtemperature_fault_timestamp_ms >
+            OVERTEMPERATURE_PROTECTION_TIMEOUT_MS) {
+          overtemperature_fault_triggered = false;
+        }
       }
+    }
+
+    if (runtime_ms - overcurrent_fault_timestamp_ms >
+        OVERCURRENT_PROTECTION_TIMEOUT_MS) {
+      overcurrent_fault_triggered = false;
     }
 
     HAL_GPIO_WritePin(DEVBOARD_LED_GPIO_Port, DEVBOARD_LED_Pin,
                       hardware_fault_triggered);
 
+    hardware_fault_triggered =
+        hardware_fault_triggered || overcurrent_fault_triggered ||
+        overtemperature_fault_triggered || voltage_fault_triggered;
+
     if (hardware_fault_triggered) {
+      __HAL_TIM_MOE_DISABLE(&htim1);
       target_speed = 0.0f;
 
-      // Wait for the timeout
-      if ((runtime_ms - fault_timestamp_ms) >=
-          OVERCURRENT_PROTECTION_TIMEOUT_MS) {
-
+      bool faults_cleared = !overcurrent_fault_triggered &&
+                            !overtemperature_fault_triggered &&
+                            !voltage_fault_triggered;
+      if (faults_cleared) {
         float pending_throttle = 0.0f;
         if (pot_mode_enabled) {
           pending_throttle = get_potentiometer_target_speed(adc1_buffer[3]);
@@ -541,19 +586,18 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks) {
   float pulse_width_us = (float)ch_ticks / (SYSCLK_FREQ / 1000000.0f);
   float target = 0.0f;
 
-  if (pulse_width_us > PWM_INPUT_CENTER_US + PWM_INPUT_DEADZONE_US;) {
+  if (pulse_width_us > PWM_INPUT_CENTER_US + PWM_INPUT_DEADZONE_US) {
     target = ((pulse_width_us - PWM_INPUT_CENTER_US) /
               (PWM_INPUT_MAX_US - PWM_INPUT_CENTER_US)) *
              100.0f;
   }
-  // Reverse (1450us down to 1000us) -> Maps to 0% to -100%
   else if (pulse_width_us < PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
     target = ((PWM_INPUT_CENTER_US - pulse_width_us) /
               (PWM_INPUT_CENTER_US - PWM_INPUT_MIN_US)) *
              -100.0f;
   }
 
-  // Clamp limits to perfectly protect the PWM outputs
+  // Clamp limits 
   if (target > 100.0f)
     target = 100.0f;
   if (target < -100.0f)
