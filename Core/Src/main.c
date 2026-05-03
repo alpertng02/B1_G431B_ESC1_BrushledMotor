@@ -23,10 +23,10 @@
 #include "dac.h"
 #include "dma.h"
 #include "fdcan.h"
+#include "gpio.h"
 #include "opamp.h"
 #include "tim.h"
 #include "usart.h"
-#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -44,7 +44,13 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define SYSCLK_FREQ (170e6)
-#define PWM_INPUT_MAX_PERIOD_MS (5)
+
+#define PWM_INPUT_MAX_PERIOD_MS (50)
+#define PWM_INPUT_MIN_US (1000.0f)
+#define PWM_INPUT_MAX_US (2000.0f)
+#define PWM_INPUT_CENTER_US (1500.0f)
+#define PWM_INPUT_DEADZONE_US (50.0f)
+
 #define CURRENT_LOWPASS_ALPHA (0.1f)
 
 #define BUS_VOLTAGE_DIVIDER_RATIO (17.9f)
@@ -55,8 +61,6 @@
 
 #define CELL_VOLTAGE_LOW (3.0f)
 #define CELL_VOLTAGE_HIGH (4.2f)
-
-#define BATTERY_CELL_COUNT (6)
 
 #define OVERVOLTAGE_RATE_ALLOWED (1.2f)
 #define UNDERVOLTAGE_RATE_ALLOWED (1.0f)
@@ -80,9 +84,7 @@ volatile static int32_t current_raw = 0;
 volatile static float current_mA = 0;
 volatile static float target_speed = 0; // Changes from -100.0 to +100.0
 
-volatile static uint32_t pwm_input_frequency = 0;
-volatile static uint32_t pwm_input_cycletime = 0;
-volatile static float pwm_input_duty = 0.0;
+volatile static float pwm_input_target_duty = 0.0;
 
 volatile bool hardware_fault_triggered = false;
 volatile static bool pot_mode_enabled = false;
@@ -110,6 +112,7 @@ volatile static int32_t offset_v = 2540;
 
 volatile static float board_temp_C = 0.0f;
 
+volatile static int32_t battery_cell_count = 6;
 volatile static bool voltage_protection_on = true;
 volatile static bool temperature_protection_on = true;
 volatile static bool overcurrent_protection_on = true;
@@ -130,20 +133,20 @@ float get_bus_voltage(uint32_t adc_val);
 float get_shunt_resistor_current(uint32_t adc_val, uint32_t offset);
 float get_potentiometer_target_speed(uint32_t adc_val);
 
+float get_rc_pwm_target_speed(uint32_t ch_ticks);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
 
@@ -151,7 +154,8 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -289,21 +293,20 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-  */
+   */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+   * in the RCC_OscInitTypeDef structure.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -313,22 +316,20 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
     Error_Handler();
   }
 }
@@ -369,9 +370,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     uint32_t ch = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 
     if (cl > 0) {
-      pwm_input_frequency = (float)SYSCLK_FREQ / (cl + 1);
-      pwm_input_duty = 100.0f * (float)ch / cl;
-
+      pwm_input_target_duty = get_rc_pwm_target_speed(ch);
       last_pwm_input_ms = runtime_ms;
     }
   }
@@ -390,9 +389,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     // Over/Undervoltage Protection
     if (voltage_protection_on) {
-      if (bus_voltage_v < BATTERY_CELL_COUNT * CELL_VOLTAGE_LOW *
+      if (bus_voltage_v < battery_cell_count * CELL_VOLTAGE_LOW *
                               UNDERVOLTAGE_RATE_ALLOWED ||
-          bus_voltage_v > BATTERY_CELL_COUNT * CELL_VOLTAGE_HIGH *
+          bus_voltage_v > battery_cell_count * CELL_VOLTAGE_HIGH *
                               OVERVOLTAGE_RATE_ALLOWED) {
         hardware_fault_triggered = true;
         fault_timestamp_ms = runtime_ms;
@@ -430,7 +429,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         if (pot_mode_enabled) {
           pending_throttle = get_potentiometer_target_speed(adc1_buffer[3]);
         } else {
-          pending_throttle = pwm_input_duty;
+          pending_throttle = pwm_input_target_duty;
         }
 
         // Only re-arm if the throttle is in the neutral deadzone
@@ -444,10 +443,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       target_speed = get_potentiometer_target_speed(adc1_buffer[3]);
     } else {
       if (runtime_ms - last_pwm_input_ms > PWM_INPUT_MAX_PERIOD_MS) {
-        pwm_input_duty = 0.0f;
-        pwm_input_frequency = 0;
+        pwm_input_target_duty = 0.0f;
       }
-      target_speed = pwm_input_duty; // Assuming mapping is fixed!
+      target_speed = pwm_input_target_duty; // Assuming mapping is fixed!
     }
 
     set_motor_speed(target_speed);
@@ -541,14 +539,32 @@ float get_potentiometer_target_speed(uint32_t adc_val) {
   return target;
 }
 
+float get_rc_pwm_target_speed(uint32_t ch_ticks) {
+  float pulse_width_us = (float)ch_ticks / (SYSCLK_FREQ / 1000000.0f);
+  float target = 0.0f;
+
+  if (pulse_width_us > PWM_INPUT_CENTER_US + PWM_INPUT_DEADZONE_US;) {
+    target = ((pulse_width_us - PWM_INPUT_CENTER_US) / (PWM_INPUT_MAX_US - PWM_INPUT_CENTER_US)) * 100.0f;
+  } 
+  // Reverse (1450us down to 1000us) -> Maps to 0% to -100%
+  else if (pulse_width_us <  PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
+    target = ((PWM_INPUT_CENTER_US - pulse_width_us) / (PWM_INPUT_CENTER_US - PWM_INPUT_MIN_US)) * -100.0f;
+  }
+
+  // Clamp limits to perfectly protect the PWM outputs
+  if (target > 100.0f) target = 100.0f;
+  if (target < -100.0f) target = -100.0f;
+
+  return target;
+}
+
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state
    */
@@ -559,14 +575,13 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
