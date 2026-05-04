@@ -86,6 +86,7 @@ typedef struct {
 } MotorControl_t;
 
 typedef struct {
+  bool overcurrent_protection_on;
   bool overtemperature_protection_on;
   bool voltage_protection_on;
 
@@ -256,6 +257,7 @@ int main(void) {
   esc_system.state = ESC_STATE_BOOTING;
   esc_system.control.active_mode = ESC_INPUT_MODE_PWM;
 
+  esc_system.protection.overcurrent_protection_on = true;
   esc_system.protection.overtemperature_protection_on = true;
   esc_system.protection.voltage_protection_on = true;
   esc_system.protection.battery_cell_count = DEFAULT_BATTERY_CELL_COUNT;
@@ -511,6 +513,24 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
     }
   }
 
+  if (esc->protection.overcurrent_protection_on) {
+    // If the STM32 hardware killed the timer outputs but the software didn't
+    // know:
+    if ((TIM1->BDTR & TIM_BDTR_MOE) == 0) {
+      esc->faults.overcurrent = true;
+      esc->faults.oc_timestamp_ms = current_time_ms;
+      esc->faults.fault_latch = true;
+    }
+
+    float current_a = MAX(fabsf(esc->sensors.phase_u_current), fabsf(esc->sensors.phase_v_current)) / 1000.0f;
+    if (current_a >= esc->protection.current_threshold_amps) {
+      esc->faults.overcurrent = true;
+      esc->faults.oc_timestamp_ms = current_time_ms;
+    } else if (current_time_ms - esc->faults.oc_timestamp_ms >
+               OVERCURRENT_PROTECTION_TIMEOUT_MS) {
+      esc->faults.overcurrent = false;
+    }
+  }
   // Check Temperature
   if (esc->protection.overtemperature_protection_on) {
     if (esc->sensors.board_temp_c > esc->protection.temperature_threshold_c) {
@@ -520,13 +540,6 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
                OVERTEMPERATURE_PROTECTION_TIMEOUT_MS) {
       esc->faults.overtemp = false;
     }
-  }
-
-  // Check Current Timeout (Flag is set to true by hardware BreakCallback)
-  if (esc->faults.overcurrent &&
-      (current_time_ms - esc->faults.oc_timestamp_ms >
-       OVERCURRENT_PROTECTION_TIMEOUT_MS)) {
-    esc->faults.overcurrent = false;
   }
 
   // Master Latch
@@ -586,13 +599,6 @@ void MotorState_Update(ESC_Context_t *esc) {
     break;
 
   case ESC_STATE_RUNNING:
-    // If the STM32 hardware killed the timer outputs but the software didn't
-    // know:
-    if ((TIM1->BDTR & TIM_BDTR_MOE) == 0) {
-      esc->faults.overcurrent = true;
-      esc->faults.oc_timestamp_ms = current_time_ms;
-      esc->faults.fault_latch = true;
-    }
 
     if (esc->faults.fault_latch) {
       esc->state = ESC_STATE_FAULT;
