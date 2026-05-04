@@ -119,13 +119,14 @@ typedef struct {
 typedef struct {
   float target_speed; // 4 Bytes (-100.0 to 100.0)
 
-  uint16_t config_change : 1;
-  uint16_t enable_running_mode : 1;
-  uint16_t enable_encoder : 1;
-  uint16_t enable_overtemperature_protection : 1;
-  uint16_t enable_voltage_protection : 1;
-  uint16_t overcurrent_threshold_amps : 6;
-  uint16_t battery_cell_count : 4;
+  uint32_t config_change : 1;
+  uint32_t enable_running_mode : 1;
+  uint32_t enable_encoder : 1;
+  uint32_t enable_overcurrent_protection : 1;
+  uint32_t enable_overtemperature_protection : 1;
+  uint32_t enable_voltage_protection : 1;
+  uint32_t overcurrent_threshold_amps : 6;
+  uint32_t battery_cell_count : 4;
   //
 } ControlPacket;
 #pragma pack(pop)
@@ -134,7 +135,6 @@ typedef struct {
 typedef struct {
   uint16_t header; // 2 Bytes
   ControlPacket packet;
-  uint16_t footer; // 2 Bytes
 } ControlPacketUART;
 #pragma pack(pop)
 
@@ -522,7 +522,9 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
       esc->faults.fault_latch = true;
     }
 
-    float current_a = MAX(fabsf(esc->sensors.phase_u_current), fabsf(esc->sensors.phase_v_current)) / 1000.0f;
+    float current_a = MAX(fabsf(esc->sensors.phase_u_current),
+                          fabsf(esc->sensors.phase_v_current)) /
+                      1000.0f;
     if (current_a >= esc->protection.current_threshold_amps) {
       esc->faults.overcurrent = true;
       esc->faults.oc_timestamp_ms = current_time_ms;
@@ -797,17 +799,13 @@ float handle_control_packet(ESC_Context_t *esc, const ControlPacket *packet) {
     esc->protection.overtemperature_protection_on =
         packet->enable_overtemperature_protection;
     esc->protection.voltage_protection_on = packet->enable_voltage_protection;
+    esc->protection.overcurrent_protection_on = packet->enable_overcurrent_protection;
     esc->protection.current_threshold_amps = packet->overcurrent_threshold_amps;
 
     set_overcurrent_protection_threshold(esc->protection.current_threshold_amps,
                                          offset_u, offset_v);
   }
-
-  if (packet->enable_running_mode) {
-    return packet->target_speed;
-  } else {
-    return 0.0f;
-  }
+  return packet->target_speed;
 }
 
 // --- UART RECEIVE EVENT ---
@@ -818,8 +816,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
       ControlPacketUART *uart_msg = (ControlPacketUART *)uart_rx_buffer;
 
       // Verify data integrity using your new macros
-      if (uart_msg->header == UART_HEADER_BYTES &&
-          uart_msg->footer == UART_FOOTER_BYTES) {
+      if (uart_msg->header == UART_HEADER_BYTES) {
 
         esc_system.control.raw_uart_input =
             handle_control_packet(&esc_system, &(uart_msg->packet));
