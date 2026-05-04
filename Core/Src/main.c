@@ -25,6 +25,7 @@
 #include "fdcan.h"
 #include "gpio.h"
 #include "opamp.h"
+#include "stm32g4xx_hal_fdcan.h"
 #include "stm32g4xx_hal_tim.h"
 #include "tim.h"
 #include "usart.h"
@@ -40,15 +41,100 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum {
+  ESC_STATE_BOOTING,
+  ESC_STATE_IDLE,    // Waiting for valid zero-throttle command
+  ESC_STATE_RUNNING, // Actively driving the motor
+  ESC_STATE_FAULT    // Safety lockout
+} ESC_State;
+
+typedef enum {
+  ESC_INPUT_MODE_PWM,
+  ESC_INPUT_MODE_UART,
+  ESC_INPUT_MODE_CAN,
+  ESC_INPUT_MODE_POT
+} ESC_InputMode;
+
+typedef struct {
+  float phase_u_current;
+  float phase_v_current;
+
+  float bemf_u_voltage;
+  float bemf_v_voltage;
+
+  float bus_voltage;
+  float board_temp_c;
+} MotorSensors_t;
+
+typedef struct {
+  float target_speed;
+  float current_speed;
+
+  // Independent raw inputs
+  float raw_pwm_input;
+  float raw_uart_input;
+  float raw_can_input;
+
+  // Independent timeout trackers
+  uint32_t last_pwm_cmd_ms;
+  uint32_t last_uart_cmd_ms;
+  uint32_t last_can_cmd_ms;
+
+  // State tracking
+  bool pot_override_active;
+  ESC_InputMode active_mode; // Kept so telemetry knows who is driving!
+} MotorControl_t;
+
+typedef struct {
+  bool overtemperature_protection_on;
+  bool voltage_protection_on;
+
+  uint8_t battery_cell_count;
+  uint8_t current_threshold_amps;
+  uint8_t temperature_threshold_c;
+} ESC_Protection_t;
+
+typedef struct {
+  bool overcurrent;
+  bool overtemp;
+  bool overvoltage;
+  bool fault_latch;
+
+  uint32_t oc_timestamp_ms;
+  uint32_t ot_timestamp_ms;
+  uint32_t ov_timestamp_ms;
+} SystemFaults_t;
+
+// The Master Context
+typedef struct {
+  MotorSensors_t sensors;
+  MotorControl_t control;
+  ESC_Protection_t protection;
+  SystemFaults_t faults;
+  ESC_State state;
+} ESC_Context_t;
+
 #pragma pack(push, 1)
 typedef struct {
-  uint16_t header;      // 2 Bytes (0xAA55)
-  float target_speed;   // 4 Bytes (-100.0 to 100.0)
-  uint8_t enable_motor; // 1 Byte  (1 = Run, 0 = Stop)
-  uint8_t padding[3];   // 3 Bytes (Forces struct to exactly 12 bytes for FDCAN
-                        // alignment)
-  uint16_t footer;      // 2 Bytes (0x55AA)
-} ControlPacket;        // Total = 12 Bytes
+  float target_speed; // 4 Bytes (-100.0 to 100.0)
+
+  uint16_t config_change : 1;
+  uint16_t enable_running_mode : 1;
+  uint16_t enable_encoder : 1;
+  uint16_t enable_overtemperature_protection : 1;
+  uint16_t enable_voltage_protection : 1;
+  uint16_t overcurrent_threshold_amps : 6;
+  uint16_t battery_cell_count : 4;
+  //
+} ControlPacket; // Total = 12 Bytes
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t header; // 2 Bytes
+  ControlPacket packet;
+  uint16_t footer; // 2 Bytes
+} ControlPacketUART;
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -63,14 +149,19 @@ typedef struct {
 #define PWM_INPUT_CENTER_US (1500.0f)
 #define PWM_INPUT_DEADZONE_US (20.0f)
 
+#define UART_HEADER_BYTES (0x726F)
+#define UART_FOOTER_BYTES (0x7365)
+
 #define CURRENT_LOWPASS_ALPHA (0.1f)
 
-#define BUS_VOLTAGE_DIVIDER_RATIO (17.9f)
+#define BUS_VOLTAGE_DIVIDER_RATIO (10.388f)
 #define BEMF_VOLTAGE_DIVIDER_RATIO (8.02f)
+#define DAC_AMP_TO_BITS_RATIO (59.5f)
 
 #define CANBUS_TERMINATION_RESISTOR_ACTIVE (0)
 #define CANBUS_TRANSCEIVER_ACTIVE (1)
 
+#define DEFAULT_BATTERY_CELL_COUNT (6)
 #define CELL_VOLTAGE_LOW (3.0f)
 #define CELL_VOLTAGE_HIGH (4.2f)
 
@@ -78,9 +169,7 @@ typedef struct {
 #define UNDERVOLTAGE_RATE_ALLOWED (1.0f)
 
 #define OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS (80.0f)
-
 #define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
-#define DAC_AMP_TO_BITS_RATIO (59.5f)
 
 #define OVERCURRENT_PROTECTION_TIMEOUT_MS (2000)
 #define OVERTEMPERATURE_PROTECTION_TIMEOUT_MS (5000)
@@ -98,54 +187,32 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile static int32_t current_raw = 0;
-volatile static float current_mA = 0;
-volatile static float target_speed = 0; // Changes from -100.0 to +100.0
 
-volatile static float pwm_input_target_duty = 0.0;
+// --- THE MASTER SYSTEM VARIABLE ---
+ESC_Context_t esc_system = {0};
 
-volatile static float bus_voltage_v = 0.0f;
-
-volatile static uint32_t phase_u_raw = 0;
-volatile static uint32_t phase_v_raw = 0;
-
+// Hardware tracking and filtering
 volatile float current_u_filtered = 0.0f;
 volatile float current_v_filtered = 0.0f;
+volatile static int32_t offset_u = 2540;
+volatile static int32_t offset_v = 2540;
 
 volatile static float bemf_u_V = 0.0f;
 volatile static float bemf_v_V = 0.0f;
 volatile static float bemf_w_V = 0.0f;
 
-// [0] Phase U Current, [1] Bus Voltage, [2] NTC Temperature, [3] Potentiometer
 volatile uint32_t adc1_buffer[4];
-// [0] Phase V Current, [1] BEMF_U, [2] BEMF_V, [3] BEMF_W
 volatile uint32_t adc2_buffer[4];
 
-volatile static int32_t offset_u = 2540;
-volatile static int32_t offset_v = 2540;
+// Communication Buffers
+static uint8_t uart_rx_buffer[sizeof(ControlPacketUART)];
 
-volatile static float board_temp_C = 0.0f;
+FDCAN_RxHeaderTypeDef CanRxHeader;
+static uint8_t can_rx_data[64];
 
-volatile static int32_t battery_cell_count = 6;
-volatile static bool voltage_protection_on = true;
-volatile static bool temperature_protection_on = true;
-volatile static bool overcurrent_protection_on = true;
-
-volatile bool overcurrent_fault_triggered = false;
-volatile bool overtemperature_fault_triggered = false;
-volatile bool voltage_fault_triggered = false;
-
-volatile bool hardware_fault_triggered = false;
-volatile static bool pot_mode_enabled = false;
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
+volatile static uint64_t current_time_ms = 0;
 
-volatile static uint64_t runtime_ms = 0;
-volatile static uint64_t last_pwm_input_ms = 0;
-
-volatile static uint64_t overcurrent_fault_timestamp_ms = 0;
-volatile static uint64_t voltage_fault_timestamp_ms = 0;
-volatile static uint64_t overtemperature_fault_timestamp_ms = 0;
-volatile static uint64_t fault_timestamp_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -154,12 +221,23 @@ void SystemClock_Config(void);
 
 void set_motor_speed(float speed_percent);
 
+void setup_serial_communication(uint32_t can_id, uint8_t *uart_rx_buf,
+                                uint16_t packet_size);
+void set_overcurrent_protection_threshold(float threshold_A,
+                                          int32_t shunt_offset_u,
+                                          int32_t shunt_offset_v);
+void calibrate_shunt_adc_offsets(int32_t *shunt_offset_u,
+                                 int32_t *shunt_offset_v);
 float get_ntc_temperature_c(uint32_t adc_val);
 float get_bus_voltage(uint32_t adc_val);
 float get_shunt_resistor_current(uint32_t adc_val, uint32_t offset);
 float get_potentiometer_target_speed(uint32_t adc_val);
-
 float get_rc_pwm_target_speed(uint32_t ch_ticks);
+
+void MotorSensors_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
+void FaultMonitor_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
+void MotorControl_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
+void MotorState_Update(ESC_Context_t *ctx);
 
 /* USER CODE END PFP */
 
@@ -175,6 +253,16 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks);
 int main(void) {
 
   /* USER CODE BEGIN 1 */
+  esc_system.state = ESC_STATE_BOOTING;
+  esc_system.control.active_mode = ESC_INPUT_MODE_PWM;
+
+  esc_system.protection.overtemperature_protection_on = true;
+  esc_system.protection.voltage_protection_on = false;
+  esc_system.protection.battery_cell_count = DEFAULT_BATTERY_CELL_COUNT;
+  esc_system.protection.current_threshold_amps =
+      OVERCURRENT_PROTECTION_THRESHOLD_AMPS;
+  esc_system.protection.temperature_threshold_c =
+      OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS;
 
   /* USER CODE END 1 */
 
@@ -222,11 +310,11 @@ int main(void) {
   HAL_GPIO_WritePin(CAN_TERMINATION_GPIO_Port, CAN_TERMINATION_Pin,
                     CANBUS_TERMINATION_RESISTOR_ACTIVE);
 
-  // 1. Power up the Operational Amplifiers
+  // Power up the Operational Amplifiers
   HAL_OPAMP_Start(&hopamp1);
   HAL_OPAMP_Start(&hopamp2);
 
-  // 2. Calibrate the ADCs (CRITICAL for STM32G4!)
+  // Calibrate the ADCs (CRITICAL for STM32G4!)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
@@ -234,11 +322,11 @@ int main(void) {
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc1_buffer, 4);
   HAL_ADC_Start_DMA(&hadc2, (uint32_t *)adc2_buffer, 4);
 
-  // 3. Start Phase U (OUT1) PWM
+  // Start Phase U (OUT1) PWM
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
 
-  // 4. Start Phase V (OUT2) PWM
+  // Start Phase V (OUT2) PWM
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
 
@@ -246,47 +334,20 @@ int main(void) {
 
   HAL_Delay(10);
 
-  uint32_t sum_u = 0;
-  uint32_t sum_v = 0;
-  const int NUM_CAL_SAMPLES = 100;
+  int32_t shunt_offset_u = 0;
+  int32_t shunt_offset_v = 0;
+  calibrate_shunt_adc_offsets(&shunt_offset_u, &shunt_offset_v);
+  offset_u = shunt_offset_u;
+  offset_v = shunt_offset_v;
 
-  for (int i = 0; i < NUM_CAL_SAMPLES; i++) {
-    // The DMA updates these variables automatically at 20kHz
-    sum_u += adc1_buffer[0];
-    sum_v += adc2_buffer[0];
-    HAL_Delay(1); // Wait 1ms between reads (collecting data over 100ms)
-  }
+  set_overcurrent_protection_threshold(OVERCURRENT_PROTECTION_THRESHOLD_AMPS,
+                                       offset_u, offset_v);
 
-  // Calculate the average offset
-  offset_u = sum_u / NUM_CAL_SAMPLES;
-  offset_v = sum_v / NUM_CAL_SAMPLES;
-
-  // ==========================================================
-  // --- HARDWARE OVERCURRENT PROTECTION SETUP ---
-  // ==========================================================
-  // 1 Amp = ~59.5 raw units. For 20A trip limit: 20 * 59.5 = 1190
-  const uint32_t TRIP_DELTA =
-      (uint32_t)(OVERCURRENT_PROTECTION_THRESHOLD_AMPS * DAC_AMP_TO_BITS_RATIO);
-
-  uint32_t trip_limit_u = offset_u + TRIP_DELTA;
-  uint32_t trip_limit_v = offset_v + TRIP_DELTA;
-
-  // Clamp limits to maximum 12-bit value (4095) just in case
-  if (trip_limit_u > 4095)
-    trip_limit_u = 4095;
-  if (trip_limit_v > 4095)
-    trip_limit_v = 4095;
-
-  // 1. Set the DAC thresholds
-  // DAC CH1 feeds COMP1 (Phase U), DAC CH2 feeds COMP2 (Phase V)
-  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_1, DAC_ALIGN_12B_R, trip_limit_u);
-  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_2, DAC_ALIGN_12B_R, trip_limit_v);
-
-  // 2. Start the DAC
+  // Start the DAC
   HAL_DAC_Start(&hdac3, DAC_CHANNEL_1);
   HAL_DAC_Start(&hdac3, DAC_CHANNEL_2);
 
-  // 3. Start the Comparators to watch the OPAMPs
+  // Start the Comparators to watch the OPAMPs
   HAL_COMP_Start(&hcomp1);
   HAL_COMP_Start(&hcomp2);
   // ==========================================================
@@ -295,6 +356,11 @@ int main(void) {
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // Signal Input Channel (Main)
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);    // Secondary Channel
 
+  setup_serial_communication(FDCAN_STANDARD_ID, uart_rx_buffer,
+                             sizeof(uart_rx_buffer));
+
+  esc_system.state = ESC_STATE_IDLE;
+  // Start motor control timer
   HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
@@ -307,7 +373,8 @@ int main(void) {
         HAL_GPIO_ReadPin(DEVBOARD_BUTTON_GPIO_Port, DEVBOARD_BUTTON_Pin);
     if (devboard_button_pressed == GPIO_PIN_RESET &&
         last_devboard_button_state != GPIO_PIN_RESET) {
-      pot_mode_enabled = !pot_mode_enabled;
+      esc_system.control.pot_override_active =
+          !esc_system.control.pot_override_active;
     }
     last_devboard_button_state = devboard_button_pressed;
     HAL_Delay(10);
@@ -365,26 +432,18 @@ void SystemClock_Config(void) {
 // This automatically fires if COMP1 or COMP2 trips TIM1
 void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM1) {
-    overcurrent_fault_triggered = true;
-    overcurrent_fault_timestamp_ms = runtime_ms;
-    target_speed = 0.0f;
+    esc_system.faults.overcurrent = true;
+    esc_system.faults.oc_timestamp_ms = current_time_ms;
   }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
-
   if (hadc->Instance == ADC1) {
-    // 1. Calculate real mA for Phase U
     float inst_mA_u = get_shunt_resistor_current(adc1_buffer[0], offset_u);
-
-    // 2. Apply 20 kHz Software IIR Filter
     current_u_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_u) +
                          ((1.0f - CURRENT_LOWPASS_ALPHA) * current_u_filtered);
   } else if (hadc->Instance == ADC2) {
-    // 1. Calculate real mA for Phase V
     float inst_mA_v = get_shunt_resistor_current(adc2_buffer[0], offset_v);
-
-    // 2. Apply 20 kHz Software IIR Filter
     current_v_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_v) +
                          ((1.0f - CURRENT_LOWPASS_ALPHA) * current_v_filtered);
   }
@@ -396,8 +455,9 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     uint32_t ch = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 
     if (cl > 0) {
-      pwm_input_target_duty = get_rc_pwm_target_speed(ch);
-      last_pwm_input_ms = runtime_ms;
+      // Feed the raw value into the struct and reset the watchdog timer!
+      esc_system.control.raw_pwm_input = get_rc_pwm_target_speed(ch);
+      esc_system.control.last_pwm_cmd_ms = current_time_ms;
     }
   }
 }
@@ -408,111 +468,176 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
-    runtime_ms++;
+    current_time_ms++;
 
-    // Read battery voltages
-    bus_voltage_v = get_bus_voltage(adc1_buffer[1]);
+    MotorSensors_Update(&esc_system, current_time_ms);
+    FaultMonitor_Update(&esc_system, current_time_ms);
+    MotorControl_Update(&esc_system, current_time_ms);
+    MotorState_Update(&esc_system);
+  }
+}
 
-    // Over/Undervoltage Protection
-    if (voltage_protection_on) {
-      if (bus_voltage_v < battery_cell_count * CELL_VOLTAGE_LOW *
-                              UNDERVOLTAGE_RATE_ALLOWED ||
-          bus_voltage_v > battery_cell_count * CELL_VOLTAGE_HIGH *
-                              OVERVOLTAGE_RATE_ALLOWED) {
-        voltage_fault_triggered = true;
-        voltage_fault_timestamp_ms = runtime_ms;
-      } else {
-        if (runtime_ms - voltage_fault_timestamp_ms >
-            VOLTAGE_PROTECTION_TIMEOUT_MS) {
-          voltage_fault_triggered = false;
-        }
-      }
-    }
+// ============================================================================
+// --- MODULAR ARCHITECTURE FUNCTIONS ---
+// ============================================================================
 
-    bemf_u_V =
-        (float)adc2_buffer[1] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
-    bemf_v_V =
-        (float)adc2_buffer[2] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
-    bemf_w_V =
-        (float)adc2_buffer[3] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+void MotorSensors_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
 
-    board_temp_C = get_ntc_temperature_c(adc1_buffer[2]);
-    // Over-Temperature Protection
-    if (temperature_protection_on) {
-      if (board_temp_C > OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS) {
-        overtemperature_fault_triggered = true;
-        overtemperature_fault_timestamp_ms = runtime_ms;
-      } else {
-        if (runtime_ms - overtemperature_fault_timestamp_ms >
-            OVERTEMPERATURE_PROTECTION_TIMEOUT_MS) {
-          overtemperature_fault_triggered = false;
-        }
-      }
-    }
+  esc->sensors.phase_u_current = current_u_filtered;
+  esc->sensors.phase_v_current = current_v_filtered;
 
-    if (runtime_ms - overcurrent_fault_timestamp_ms >
-        OVERCURRENT_PROTECTION_TIMEOUT_MS) {
-      overcurrent_fault_triggered = false;
-    }
+  esc->sensors.bus_voltage = get_bus_voltage(adc1_buffer[1]);
+  esc->sensors.board_temp_c = get_ntc_temperature_c(adc1_buffer[2]);
 
-    HAL_GPIO_WritePin(DEVBOARD_LED_GPIO_Port, DEVBOARD_LED_Pin,
-                      hardware_fault_triggered);
+  esc->sensors.bemf_u_voltage =
+      (float)adc2_buffer[1] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+  esc->sensors.bemf_v_voltage =
+      (float)adc2_buffer[2] * (BEMF_VOLTAGE_DIVIDER_RATIO * 3.3f / 4095.0f);
+}
 
-    hardware_fault_triggered =
-        hardware_fault_triggered || overcurrent_fault_triggered ||
-        overtemperature_fault_triggered || voltage_fault_triggered;
-
-    if (hardware_fault_triggered) {
-      __HAL_TIM_MOE_DISABLE(&htim1);
-      target_speed = 0.0f;
-
-      bool faults_cleared = !overcurrent_fault_triggered &&
-                            !overtemperature_fault_triggered &&
-                            !voltage_fault_triggered;
-      if (faults_cleared) {
-        float pending_throttle = 0.0f;
-        if (pot_mode_enabled) {
-          pending_throttle = get_potentiometer_target_speed(adc1_buffer[3]);
-        } else {
-          pending_throttle = pwm_input_target_duty;
-        }
-
-        // Only re-arm if the throttle is in the neutral deadzone
-        if (pending_throttle > -5.0f && pending_throttle < 5.0f) {
-          hardware_fault_triggered = false;
-          __HAL_TIM_MOE_ENABLE(&htim1); // Re-enable the pwm output
-        }
-      }
-    } else if (pot_mode_enabled) {
-      // DMA constantly updates adc1_buffer
-      target_speed = get_potentiometer_target_speed(adc1_buffer[3]);
-    } else {
-      if (runtime_ms - last_pwm_input_ms > PWM_INPUT_MAX_PERIOD_MS) {
-        pwm_input_target_duty = 0.0f;
-      }
-      target_speed = pwm_input_target_duty; // Assuming mapping is fixed!
-    }
-
-    set_motor_speed(target_speed);
-
-    // Get current based on direction
-    if (target_speed > 0) {
-      // Forward: Phase V
-      current_mA = current_v_filtered;
-    } else if (target_speed < 0) {
-      // Reverse: Phase U
-      current_mA = current_u_filtered;
-    } else {
-      current_mA = 0.0f;
+void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
+  // Check Voltage
+  if (esc->protection.voltage_protection_on) {
+    const float v_min = esc->protection.battery_cell_count * CELL_VOLTAGE_LOW *
+                        UNDERVOLTAGE_RATE_ALLOWED;
+    const float v_max = esc->protection.battery_cell_count * CELL_VOLTAGE_HIGH *
+                        OVERVOLTAGE_RATE_ALLOWED;
+    if (esc->sensors.bus_voltage < v_min || esc->sensors.bus_voltage > v_max) {
+      esc->faults.overvoltage = true;
+      esc->faults.ov_timestamp_ms = current_time_ms;
+    } else if (current_time_ms - esc->faults.ov_timestamp_ms >
+               VOLTAGE_PROTECTION_TIMEOUT_MS) {
+      esc->faults.overvoltage = false;
     }
   }
+
+  // Check Temperature
+  if (esc->protection.overtemperature_protection_on) {
+    if (esc->sensors.board_temp_c > esc->protection.temperature_threshold_c) {
+      esc->faults.overtemp = true;
+      esc->faults.ot_timestamp_ms = current_time_ms;
+    } else if (current_time_ms - esc->faults.ot_timestamp_ms >
+               OVERTEMPERATURE_PROTECTION_TIMEOUT_MS) {
+      esc->faults.overtemp = false;
+    }
+  }
+
+  // Check Current Timeout (Flag is set to true by hardware BreakCallback)
+  if (esc->faults.overcurrent &&
+      (current_time_ms - esc->faults.oc_timestamp_ms >
+       OVERCURRENT_PROTECTION_TIMEOUT_MS)) {
+    esc->faults.overcurrent = false;
+  }
+
+  // Master Latch
+  esc->faults.fault_latch = esc->faults.overvoltage || esc->faults.overtemp ||
+                            esc->faults.overcurrent;
+  HAL_GPIO_WritePin(DEVBOARD_LED_GPIO_Port, DEVBOARD_LED_Pin,
+                    esc->faults.fault_latch);
+}
+
+void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
+  // --- 1. POT OVERRIDE (Absolute Highest Priority) ---
+  if (esc->control.pot_override_active) {
+    esc->control.active_mode = ESC_INPUT_MODE_POT;
+    esc->control.target_speed = get_potentiometer_target_speed(adc1_buffer[3]);
+  }
+  // --- 2. AUTO-DETECT ROUTER ---
+  else {
+    // Evaluate which connections are "alive" (received a packet recently)
+    bool can_active = (current_time_ms - esc->control.last_can_cmd_ms) <= 500;
+    bool uart_active = (current_time_ms - esc->control.last_uart_cmd_ms) <= 500;
+    bool pwm_active = (current_time_ms - esc->control.last_pwm_cmd_ms) <=
+                      PWM_INPUT_MAX_PERIOD_MS;
+
+    // Cascade down the priority list: CAN -> UART -> PWM
+    if (can_active) {
+      esc->control.active_mode = ESC_INPUT_MODE_CAN;
+      esc->control.target_speed = esc->control.raw_can_input;
+    } else if (uart_active) {
+      esc->control.active_mode = ESC_INPUT_MODE_UART;
+      esc->control.target_speed = esc->control.raw_uart_input;
+    } else if (pwm_active) {
+      esc->control.active_mode = ESC_INPUT_MODE_PWM;
+      esc->control.target_speed = esc->control.raw_pwm_input;
+    } else {
+      esc->control.target_speed = 0.0f; // Failsafe: No valid inputs
+    }
+  }
+}
+
+void MotorState_Update(ESC_Context_t *esc) {
+  switch (esc->state) {
+  case ESC_STATE_BOOTING:
+    // Do nothing, wait for initialization to finish
+    break;
+
+  case ESC_STATE_IDLE:
+    set_motor_speed(0.0f);
+    if (esc->faults.fault_latch) {
+      esc->state = ESC_STATE_FAULT;
+    }
+    // Re-arm only if throttle is in neutral deadzone (-5% to 5%)
+    else if (esc->control.target_speed > -5.0f &&
+             esc->control.target_speed < 5.0f) {
+      __HAL_TIM_MOE_ENABLE(&htim1);
+      esc->state = ESC_STATE_RUNNING;
+    }
+    break;
+
+  case ESC_STATE_RUNNING:
+    if (esc->faults.fault_latch) {
+      esc->state = ESC_STATE_FAULT;
+    } else {
+      set_motor_speed(esc->control.target_speed);
+    }
+    break;
+
+  case ESC_STATE_FAULT:
+    __HAL_TIM_MOE_DISABLE(&htim1); // Immediately kill MOSFETs
+    set_motor_speed(0.0f);         // Force target math to zero
+
+    // Once all sensors read safe, drop to IDLE to wait for neutral stick
+    if (!esc->faults.fault_latch) {
+      esc->state = ESC_STATE_IDLE;
+    }
+    break;
+  }
+}
+
+void setup_serial_communication(uint32_t can_id, uint8_t *uart_rx_buf,
+                                uint16_t packet_size) {
+  // ==========================================================
+  // --- FDCAN INITIALIZATION ---
+  // ==========================================================
+  FDCAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.IdType = can_id;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilterConfig.FilterID1 = 0x000;
+  sFilterConfig.FilterID2 = 0x000; // Mask of 0 accepts all standard IDs
+
+  HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig);
+  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                               FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
+
+  HAL_FDCAN_Start(&hfdcan1);
+  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+
+  // ==========================================================
+  // --- UART DMA INITIALIZATION ---
+  // ==========================================================
+  // We use ReceiveToIdle instead of standard Receive.
+  // This prevents the buffer from permanently misaligning if a byte is dropped!
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buf, packet_size);
 }
 
 /**
 * @brief Drives the brushed DC motor on OUT1 and OUT2
 
-* @param speed_percent: -100 to 100 (Negative for reverse, Positive for forward,
-0 to coast)
+* @param speed_percent: -100 to 100 (Negative for reverse, Positive for
+forward, 0 to coast)
 */
 void set_motor_speed(float speed_percent) {
 
@@ -547,19 +672,65 @@ void set_motor_speed(float speed_percent) {
   }
 }
 
-float get_ntc_temperature_c(uint32_t adc_val) {
-  // Calculate NTC Resistance. The B-G431B-ESC1 uses a 4.7k pull-up resistor
-  // to 3.3V
-  float ntc_voltage = (float)adc_val * (3.3f / 4095.0f);
-  float ntc_resistance = (4700.0f * ntc_voltage) / (3.3f - ntc_voltage);
+void calibrate_shunt_adc_offsets(int32_t *shunt_offset_u,
+                                 int32_t *shunt_offset_v) {
+  uint32_t sum_u = 0;
+  uint32_t sum_v = 0;
+  const int NUM_CAL_SAMPLES = 100;
 
-  // Beta Equation for Temperature (Beta = ~3380 for this NTC)
+  for (int i = 0; i < NUM_CAL_SAMPLES; i++) {
+    // The DMA updates these variables automatically at 20kHz
+    sum_u += adc1_buffer[0];
+    sum_v += adc2_buffer[0];
+    HAL_Delay(1); // Wait 1ms between reads (collecting data over 100ms)
+  }
+
+  // Calculate the average offset
+  if (shunt_offset_u)
+    *shunt_offset_u = sum_u / NUM_CAL_SAMPLES;
+  if (shunt_offset_v)
+    *shunt_offset_v = sum_v / NUM_CAL_SAMPLES;
+}
+
+void set_overcurrent_protection_threshold(float threshold_A,
+                                          int32_t shunt_offset_u,
+                                          int32_t shunt_offset_v) {
+  // 1 Amp = ~59.5 raw units. For 20A trip limit: 20 * 59.5 = 1190
+  const uint32_t TRIP_DELTA = (uint32_t)(threshold_A * DAC_AMP_TO_BITS_RATIO);
+
+  uint32_t trip_limit_u = shunt_offset_u + TRIP_DELTA;
+  uint32_t trip_limit_v = shunt_offset_v + TRIP_DELTA;
+
+  // Clamp limits to maximum 12-bit value (4095) just in case
+  if (trip_limit_u > 4095)
+    trip_limit_u = 4095;
+  if (trip_limit_v > 4095)
+    trip_limit_v = 4095;
+
+  // 1. Set the DAC thresholds
+  // DAC CH1 feeds COMP1 (Phase U), DAC CH2 feeds COMP2 (Phase V)
+  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_1, DAC_ALIGN_12B_R, trip_limit_u);
+  HAL_DAC_SetValue(&hdac3, DAC_CHANNEL_2, DAC_ALIGN_12B_R, trip_limit_v);
+}
+
+float get_ntc_temperature_c(uint32_t adc_val) {
+  // Prevent division by zero if ADC reads 0 during boot/fault
+  if (adc_val == 0)
+    return 25.0f;
+
+  float ntc_voltage = (float)adc_val * (3.3f / 4095.0f);
+
+  // CORRECTED: On the B-G431B-ESC1, the NTC is connected to 3.3V (High side)
+  // and the fixed 4.7k resistor is connected to Ground (Low side).
+  float ntc_resistance = 4700.0f * (3.3f - ntc_voltage) / ntc_voltage;
+
+  // Beta Equation for Temperature (Beta = 3380 for NCP15XH103F03RC)
   // T = 1 / ( (1/T0) + (1/B)*ln(R/R0) )
   float temp_kelvin =
       1.0f /
       ((1.0f / 298.15f) + (1.0f / 3380.0f) * logf(ntc_resistance / 10000.0f));
-  float temp_C = temp_kelvin - 273.15f;
-  return temp_C;
+
+  return temp_kelvin - 273.15f;
 }
 
 float get_bus_voltage(uint32_t adc_val) {
@@ -590,20 +761,85 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks) {
     target = ((pulse_width_us - PWM_INPUT_CENTER_US) /
               (PWM_INPUT_MAX_US - PWM_INPUT_CENTER_US)) *
              100.0f;
-  }
-  else if (pulse_width_us < PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
+  } else if (pulse_width_us < PWM_INPUT_CENTER_US - PWM_INPUT_DEADZONE_US) {
     target = ((PWM_INPUT_CENTER_US - pulse_width_us) /
               (PWM_INPUT_CENTER_US - PWM_INPUT_MIN_US)) *
              -100.0f;
   }
 
-  // Clamp limits 
+  // Clamp limits
   if (target > 100.0f)
     target = 100.0f;
   if (target < -100.0f)
     target = -100.0f;
 
   return target;
+}
+
+float handle_control_packet(ESC_Context_t *esc, const ControlPacket *packet) {
+
+  if (packet->config_change) {
+    esc->protection.battery_cell_count = packet->battery_cell_count;
+    esc->protection.overtemperature_protection_on =
+        packet->enable_overtemperature_protection;
+    esc->protection.voltage_protection_on = packet->enable_voltage_protection;
+    esc->protection.current_threshold_amps = packet->overcurrent_threshold_amps;
+
+    set_overcurrent_protection_threshold(esc->protection.current_threshold_amps,
+                                         offset_u, offset_v);
+  }
+
+  if (packet->enable_running_mode) {
+    return packet->target_speed;
+  } else {
+    return 0.0f;
+  }
+}
+
+// --- UART RECEIVE EVENT ---
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+  if (huart->Instance == USART2) {
+    // Check against the UART wrapper
+    if (Size == sizeof(ControlPacketUART)) {
+      ControlPacketUART *uart_msg = (ControlPacketUART *)uart_rx_buffer;
+
+      // Verify data integrity using your new macros
+      if (uart_msg->header == UART_HEADER_BYTES &&
+          uart_msg->footer == UART_FOOTER_BYTES) {
+
+        esc_system.control.raw_uart_input =
+            handle_control_packet(&esc_system, &(uart_msg->packet));
+
+        // Reset the UART watchdog!
+        esc_system.control.last_uart_cmd_ms = current_time_ms;
+      }
+    }
+    // Instantly restart the DMA to listen for the next packet
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer,
+                                 sizeof(ControlPacketUART));
+  }
+}
+// --- FDCAN RECEIVE EVENT ---
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
+                               uint32_t RxFifo0ITs) {
+  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
+
+    // Pull the frame out of the hardware FIFO
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader,
+                               can_rx_data) == HAL_OK) {
+
+      // The FDCAN DataLength is an enum (e.g., FDCAN_DLC_BYTES_12 is actually
+      // 0x00090000) As long as the sender packed at least 12 bytes, we can
+      // parse it.
+      ControlPacket *packet = (ControlPacket *)can_rx_data;
+
+      esc_system.control.raw_can_input =
+          handle_control_packet(&esc_system, packet);
+
+      // Reset the CAN watchdog!
+      esc_system.control.last_can_cmd_ms = current_time_ms;
+    }
+  }
 }
 
 /* USER CODE END 4 */
