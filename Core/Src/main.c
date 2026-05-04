@@ -126,7 +126,7 @@ typedef struct {
   uint16_t overcurrent_threshold_amps : 6;
   uint16_t battery_cell_count : 4;
   //
-} ControlPacket; // Total = 12 Bytes
+} ControlPacket;
 #pragma pack(pop)
 
 #pragma pack(push, 1)
@@ -161,7 +161,7 @@ typedef struct {
 #define CANBUS_TERMINATION_RESISTOR_ACTIVE (0)
 #define CANBUS_TRANSCEIVER_ACTIVE (1)
 
-#define DEFAULT_BATTERY_CELL_COUNT (6)
+#define DEFAULT_BATTERY_CELL_COUNT (7)
 #define CELL_VOLTAGE_LOW (3.0f)
 #define CELL_VOLTAGE_HIGH (4.2f)
 
@@ -257,7 +257,7 @@ int main(void) {
   esc_system.control.active_mode = ESC_INPUT_MODE_PWM;
 
   esc_system.protection.overtemperature_protection_on = true;
-  esc_system.protection.voltage_protection_on = false;
+  esc_system.protection.voltage_protection_on = true;
   esc_system.protection.battery_cell_count = DEFAULT_BATTERY_CELL_COUNT;
   esc_system.protection.current_threshold_amps =
       OVERCURRENT_PROTECTION_THRESHOLD_AMPS;
@@ -586,6 +586,14 @@ void MotorState_Update(ESC_Context_t *esc) {
     break;
 
   case ESC_STATE_RUNNING:
+    // If the STM32 hardware killed the timer outputs but the software didn't
+    // know:
+    if ((TIM1->BDTR & TIM_BDTR_MOE) == 0) {
+      esc->faults.overcurrent = true;
+      esc->faults.oc_timestamp_ms = current_time_ms;
+      esc->faults.fault_latch = true;
+    }
+
     if (esc->faults.fault_latch) {
       esc->state = ESC_STATE_FAULT;
     } else {
