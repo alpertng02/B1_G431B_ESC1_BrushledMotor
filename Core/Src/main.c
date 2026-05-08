@@ -54,6 +54,19 @@ typedef enum {
   ESC_INPUT_MODE_POT
 } ESC_InputMode;
 
+typedef enum {
+  CONTROL_MODE_DUTYCYCLE,
+  CONTROL_MODE_CURRENT,
+  CONTROL_MODE_VELOCITY
+} MotorControlMode;
+
+typedef struct {
+  float kp;
+  float ki;
+  float integral_error;
+  float output_limit;
+} PI_Controller_t;
+
 typedef struct {
   float current_mA;
 
@@ -65,8 +78,14 @@ typedef struct {
 } MotorSensors_t;
 
 typedef struct {
-  float target_speed;
-  float current_speed;
+  MotorControlMode active_control_mode; // Duty, Current, or Velocity
+
+  float target_dutycycle; // -100.0 to 100.0 %
+  float target_current_A; // e.g., -10.0 to 10.0 Amps
+  float target_velocity;  // e.g., -3000 to 3000 RPM
+
+  PI_Controller_t current_pi;
+  PI_Controller_t velocity_pi;
 
   // Independent raw inputs
   float raw_pwm_input;
@@ -249,8 +268,8 @@ const float biquad_coeffs[5] = {
     0.04125344110097427f, // b0 (zeros[0])
     0.08250688220194854f, // b1 (zeros[1])
     0.04125344110097427f, // b2 (zeros[2])
-    1.34896460150382f, // a1 (poles[1] * -1)
-    -0.5139783659077168f // a2 (poles[2] * -1)
+    1.34896460150382f,    // a1 (poles[1] * -1)
+    -0.5139783659077168f  // a2 (poles[2] * -1)
 };
 volatile float active_motor_current_mA = 0.0f;
 
@@ -279,6 +298,42 @@ void MotorSensors_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
 void FaultMonitor_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
 void MotorControl_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
 void MotorState_Update(ESC_Context_t *ctx);
+
+// Initializes a PI controller
+void PI_Init(PI_Controller_t *pi, float kp, float ki, float limit) {
+  pi->kp = kp;
+  pi->ki = ki;
+  pi->integral_error = 0.0f;
+  pi->output_limit = limit;
+}
+
+// Computes the PI algorithm
+float PI_Update(PI_Controller_t *pi, float target, float actual, float dt) {
+  float error = target - actual;
+
+  // Proportional term
+  float p_term = pi->kp * error;
+
+  // Integral term (with anti-windup clamping)
+  pi->integral_error += error * dt;
+  float i_term = pi->ki * pi->integral_error;
+
+  // Calculate total output
+  float output = p_term + i_term;
+
+  // Clamp output to limits and prevent integral windup
+  if (output > pi->output_limit) {
+    output = pi->output_limit;
+    // Un-wind the integral
+    pi->integral_error -= error * dt;
+  } else if (output < -pi->output_limit) {
+    output = -pi->output_limit;
+    // Un-wind the integral
+    pi->integral_error -= error * dt;
+  }
+
+  return output;
+}
 
 /* USER CODE END PFP */
 
@@ -346,6 +401,13 @@ int main(void) {
 
   arm_biquad_cascade_df1_init_f32(&biquad_filter_current, 1,
                                   (float *)biquad_coeffs, biquad_state_current);
+
+  // Init Current Loop (Limit output to max Duty Cycle)
+  PI_Init(&esc_system.control.current_pi, 0.5f, 0.01f, 98.0f);
+
+  // Init Velocity Loop (Limit output to slightly below Overcurrent Threshold.
+  PI_Init(&esc_system.control.velocity_pi, 0.1f, 0.001f,
+          OVERCURRENT_PROTECTION_THRESHOLD_AMPS * 0.95f);
 
   HAL_GPIO_WritePin(CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port,
                     CAN_TRANSCEIVER_SHUTDOWN_Pin, !CANBUS_TRANSCEIVER_ACTIVE);
@@ -506,6 +568,26 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     // ---------------------------------------------------------
     // 5. Your 4kHz Decimator & PI Loop goes right here!
     // ---------------------------------------------------------
+
+    // dt = 1 / 4000 = 0.00025 seconds
+    if (esc_system.state == ESC_STATE_RUNNING) {
+
+      if (esc_system.control.active_control_mode == CONTROL_MODE_DUTYCYCLE) {
+        // Open Loop: Just pass the target straight to the hardware
+        set_motor_speed(esc_system.control.target_dutycycle);
+
+      } else {
+        // Closed Loop: Run the Current PI math
+        // Note: If in Velocity mode, target_current_A was already set by TIM6!
+        float required_dutycycle = PI_Update(
+            &esc_system.control.current_pi, esc_system.control.target_current_A,
+            (active_motor_current_mA / 1000.0f), // Convert mA to A
+            0.00025f                             // 4kHz dt
+        );
+
+        set_motor_speed(required_dutycycle);
+      }
+    }
   }
 }
 
@@ -543,7 +625,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 void MotorSensors_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
 
-  esc_system.sensors.current_mA = active_motor_current_mA;
+  esc->sensors.current_mA = active_motor_current_mA;
 
   esc->sensors.bus_voltage = get_bus_voltage(adc1_buffer[1]);
   esc->sensors.board_temp_c = get_ntc_temperature_c(adc1_buffer[2]);
@@ -608,20 +690,18 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
 }
 
 void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
-  // --- 1. POT OVERRIDE (Absolute Highest Priority) ---
+  // --- 1. POT OVERRIDE ---
   if (esc->control.pot_override_active) {
     esc->control.active_mode = ESC_INPUT_MODE_POT;
     esc->control.target_speed = get_potentiometer_target_speed(adc1_buffer[3]);
   }
   // --- 2. AUTO-DETECT ROUTER ---
   else {
-    // Evaluate which connections are "alive" (received a packet recently)
     bool can_active = (current_time_ms - esc->control.last_can_cmd_ms) <= 500;
     bool uart_active = (current_time_ms - esc->control.last_uart_cmd_ms) <= 500;
     bool pwm_active = (current_time_ms - esc->control.last_pwm_cmd_ms) <=
                       PWM_INPUT_MAX_PERIOD_MS;
 
-    // Cascade down the priority list: CAN -> UART -> PWM
     if (can_active) {
       esc->control.active_mode = ESC_INPUT_MODE_CAN;
       esc->control.target_speed = esc->control.raw_can_input;
@@ -632,15 +712,34 @@ void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
       esc->control.active_mode = ESC_INPUT_MODE_PWM;
       esc->control.target_speed = esc->control.raw_pwm_input;
     } else {
-      esc->control.target_speed = 0.0f; // Failsafe: No valid inputs
+      esc->control.target_speed = 0.0f;
     }
+  }
+
+  // --- 3. TARGET ROUTER & OUTER LOOP (1 kHz) ---
+  if (esc->control.active_control_mode == CONTROL_MODE_DUTYCYCLE) {
+    // Input is treated as %
+    esc->control.target_dutycycle = esc->control.target_speed;
+  } else if (esc->control.active_control_mode == CONTROL_MODE_CURRENT) {
+    // Input is treated as Amps
+    esc->control.target_current_A = esc->control.target_speed;
+  } else if (esc->control.active_control_mode == CONTROL_MODE_VELOCITY) {
+    // Input is treated as RPM
+    esc->control.target_velocity = esc->control.target_speed;
+
+    // Calculate Outer Loop PI (Output becomes the Target for the Current loop!)
+    esc->control.target_current_A = PI_Update(
+        &esc->control.velocity_pi, esc->control.target_velocity,
+        esc->control
+            .current_speed, // Ensure you calculate RPM from your encoder!
+        0.001f              // 1kHz dt
+    );
   }
 }
 
 void MotorState_Update(ESC_Context_t *esc) {
   switch (esc->state) {
   case ESC_STATE_BOOTING:
-    // Do nothing, wait for initialization to finish
     break;
 
   case ESC_STATE_IDLE:
@@ -648,7 +747,7 @@ void MotorState_Update(ESC_Context_t *esc) {
     if (esc->faults.fault_latch) {
       esc->state = ESC_STATE_FAULT;
     }
-    // Re-arm only if throttle is in neutral deadzone (-5% to 5%)
+    // Re-arm only if throttle is in neutral deadzone
     else if (esc->control.target_speed > -5.0f &&
              esc->control.target_speed < 5.0f) {
       __HAL_TIM_MOE_ENABLE(&htim1);
@@ -657,19 +756,20 @@ void MotorState_Update(ESC_Context_t *esc) {
     break;
 
   case ESC_STATE_RUNNING:
-
     if (esc->faults.fault_latch) {
       esc->state = ESC_STATE_FAULT;
-    } else {
-      set_motor_speed(esc->control.target_speed);
     }
     break;
 
   case ESC_STATE_FAULT:
     __HAL_TIM_MOE_DISABLE(&htim1); // Immediately kill MOSFETs
-    set_motor_speed(0.0f);         // Force target math to zero
+    set_motor_speed(0.0f);         // Force hardware target to zero
 
-    // Once all sensors read safe, drop to IDLE to wait for neutral stick
+    // Wipe out the PI memory so the motor doesn't violently jerk when re-armed!
+    esc->control.current_pi.integral_error = 0.0f;
+    esc->control.velocity_pi.integral_error = 0.0f;
+
+    // Wait for neutral stick
     if (!esc->faults.fault_latch) {
       esc->state = ESC_STATE_IDLE;
     }
