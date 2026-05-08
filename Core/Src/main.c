@@ -23,17 +23,18 @@
 #include "dac.h"
 #include "dma.h"
 #include "fdcan.h"
+#include "gpio.h"
 #include "opamp.h"
 #include "tim.h"
 #include "usart.h"
-#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "arm_math.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include "arm_math.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,8 +55,7 @@ typedef enum {
 } ESC_InputMode;
 
 typedef struct {
-  float phase_u_current;
-  float phase_v_current;
+  float current_mA;
 
   float bemf_u_voltage;
   float bemf_v_voltage;
@@ -143,8 +143,7 @@ typedef struct {
 typedef struct {
   int8_t dutycycle;
   int8_t temperature_c;
-  int16_t shunt_u;
-  int16_t shunt_v;
+  float current_mA;
 } PayloadFeedback;
 
 // --- THE MASTER PACKET ---
@@ -207,7 +206,7 @@ typedef struct {
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
-//#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+// #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MAX3(a, b, c) MAX(MAX(a, b), c)
 
 /* USER CODE END PM */
@@ -240,6 +239,20 @@ static uint8_t can_rx_data[64];
 
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
 volatile static uint64_t current_time_ms = 0;
+
+// --- CMSIS-DSP BIQUAD FILTER VARS (PHASE U) ---
+arm_biquad_casd_df1_inst_f32 biquad_filter_current;
+float biquad_state_current[4];
+
+// Order: { b0, b1, b2, a1, a2 }
+const float biquad_coeffs[5] = {
+    0.000241358998f, // b0 (zeros[0])
+    0.000482717997f, // b1 (zeros[1])
+    0.000241358998f, // b2 (zeros[2])
+    1.955577832819f, // a1 (poles[1] * -1)
+    -0.956543268814f // a2 (poles[2] * -1)
+};
+volatile float active_motor_current_mA = 0.0f;
 
 /* USER CODE END PV */
 
@@ -275,11 +288,10 @@ void MotorState_Update(ESC_Context_t *ctx);
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
   esc_system.state = ESC_STATE_BOOTING;
@@ -298,7 +310,8 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -331,7 +344,9 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  // Enable or disable the
+  arm_biquad_cascade_df1_init_f32(&biquad_filter_current, 1,
+                                  (float *)biquad_coeffs, biquad_state_current);
+
   HAL_GPIO_WritePin(CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port,
                     CAN_TRANSCEIVER_SHUTDOWN_Pin, !CANBUS_TRANSCEIVER_ACTIVE);
 
@@ -415,21 +430,20 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-  */
+   */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+   * in the RCC_OscInitTypeDef structure.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -439,22 +453,20 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
     Error_Handler();
   }
 }
@@ -470,14 +482,30 @@ void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim) {
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
-  if (hadc->Instance == ADC1) {
-    float inst_mA_u = get_shunt_resistor_current(adc1_buffer[0], offset_u);
-    current_u_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_u) +
-                         ((1.0f - CURRENT_LOWPASS_ALPHA) * current_u_filtered);
-  } else if (hadc->Instance == ADC2) {
-    float inst_mA_v = get_shunt_resistor_current(adc2_buffer[0], offset_v);
-    current_v_filtered = (CURRENT_LOWPASS_ALPHA * inst_mA_v) +
-                         ((1.0f - CURRENT_LOWPASS_ALPHA) * current_v_filtered);
+
+  // Wait until ADC2 is done so we know BOTH buffers are full
+  if (hadc->Instance == ADC2) {
+
+    // 1. Get the TRUE signed readings (DO NOT use fabsf here!)
+    float raw_mA_u = get_shunt_resistor_current(adc1_buffer[0], offset_u);
+    float raw_mA_v = get_shunt_resistor_current(adc2_buffer[0], offset_v);
+
+    // 2. The H-Bridge Subtraction Trick
+    // Forward = Positive result. Reverse = Negative result.
+    // The "dead" shunt is just ~0 noise, so it barely affects the math!
+    float raw_motor_mA = raw_mA_v - raw_mA_u;
+    float filtered_result = 0.0f; // Standard local variable
+
+    // 3. Hardware Accelerated Biquad Math
+    arm_biquad_cascade_df1_f32(&biquad_filter_current, &raw_motor_mA,
+                               &filtered_result, 1);
+
+    // 4. Safely hand off the result to the volatile global
+    active_motor_current_mA = filtered_result;
+
+    // ---------------------------------------------------------
+    // 5. Your 4kHz Decimator & PI Loop goes right here!
+    // ---------------------------------------------------------
   }
 }
 
@@ -515,8 +543,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 void MotorSensors_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
 
-  esc->sensors.phase_u_current = current_u_filtered;
-  esc->sensors.phase_v_current = current_v_filtered;
+  esc_system.sensors.current_mA = active_motor_current_mA;
 
   esc->sensors.bus_voltage = get_bus_voltage(adc1_buffer[1]);
   esc->sensors.board_temp_c = get_ntc_temperature_c(adc1_buffer[2]);
@@ -552,9 +579,8 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
       esc->faults.fault_latch = true;
     }
 
-    float current_a = MAX(fabsf(esc->sensors.phase_u_current),
-                          fabsf(esc->sensors.phase_v_current)) /
-                      1000.0f;
+    float current_a = fabsf(esc->sensors.current_mA) / 1000.0f;
+
     if (current_a >= esc->protection.current_threshold_amps) {
       esc->faults.overcurrent = true;
       esc->faults.oc_timestamp_ms = current_time_ms;
@@ -823,40 +849,45 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks) {
 }
 
 // --- THE NEW PACKET ROUTER ---
-void process_master_packet(ESC_Context_t *esc, const MasterPacket *packet, ESC_InputMode source) {
-  
+void process_master_packet(ESC_Context_t *esc, const MasterPacket *packet,
+                           ESC_InputMode source) {
+
   switch (packet->msg_type) {
-      
-    case PAYLOAD_TYPE_COMMAND:
-      // Update the speed based on who sent it
-      if (source == ESC_INPUT_MODE_UART) {
-          esc->control.raw_uart_input = packet->payload.command.target_speed;
-          esc->control.last_uart_cmd_ms = current_time_ms; // Reset watchdog!
-      } else if (source == ESC_INPUT_MODE_CAN) {
-          esc->control.raw_can_input = packet->payload.command.target_speed;
-          esc->control.last_can_cmd_ms = current_time_ms; // Reset watchdog!
-      }
-      break;
 
-    case PAYLOAD_TYPE_CONFIG:
-      // Update hardware protections
-      esc->protection.battery_cell_count = packet->payload.config.battery_cell_count;
-      esc->protection.overtemperature_protection_on = packet->payload.config.enable_overtemperature_protection;
-      esc->protection.voltage_protection_on = packet->payload.config.enable_voltage_protection;
-      esc->protection.overcurrent_protection_on = packet->payload.config.enable_overcurrent_protection;
-      esc->protection.current_threshold_amps = packet->payload.config.overcurrent_threshold_amps;
-      
-      // We don't have access to offset_u / offset_v directly here since they are static vars,
-      // but assuming they are accessible globally in your setup:
-      set_overcurrent_protection_threshold(esc->protection.current_threshold_amps, offset_u, offset_v);
-      
-      // Notice we DO NOT reset the watchdog timer here! 
-      // A configuration update shouldn't keep the motor spinning.
-      break;
+  case PAYLOAD_TYPE_COMMAND:
+    // Update the speed based on who sent it
+    if (source == ESC_INPUT_MODE_UART) {
+      esc->control.raw_uart_input = packet->payload.command.target_speed;
+      esc->control.last_uart_cmd_ms = current_time_ms; // Reset watchdog!
+    } else if (source == ESC_INPUT_MODE_CAN) {
+      esc->control.raw_can_input = packet->payload.command.target_speed;
+      esc->control.last_can_cmd_ms = current_time_ms; // Reset watchdog!
+    }
+    break;
 
-    default:
-      // Unknown packet type (or Feedback packet received by mistake), ignore it
-      break;
+  case PAYLOAD_TYPE_CONFIG:
+    // Update hardware protections
+    esc->protection.battery_cell_count =
+        packet->payload.config.battery_cell_count;
+    esc->protection.overtemperature_protection_on =
+        packet->payload.config.enable_overtemperature_protection;
+    esc->protection.voltage_protection_on =
+        packet->payload.config.enable_voltage_protection;
+    esc->protection.overcurrent_protection_on =
+        packet->payload.config.enable_overcurrent_protection;
+    esc->protection.current_threshold_amps =
+        packet->payload.config.overcurrent_threshold_amps;
+
+    set_overcurrent_protection_threshold(esc->protection.current_threshold_amps,
+                                         offset_u, offset_v);
+
+    // Notice we DO NOT reset the watchdog timer here!
+    // A configuration update shouldn't keep the motor spinning.
+    break;
+
+  default:
+    // Unknown packet type (or Feedback packet received by mistake), ignore it
+    break;
   }
 }
 
@@ -869,20 +900,24 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
 
       // Verify data integrity
       if (uart_msg->header == UART_HEADER_BYTES) {
-        process_master_packet(&esc_system, &(uart_msg->packet), ESC_INPUT_MODE_UART);
+        process_master_packet(&esc_system, &(uart_msg->packet),
+                              ESC_INPUT_MODE_UART);
       }
     }
     // Instantly restart the DMA to listen for the next packet
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer, sizeof(MasterPacketUART));
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer,
+                                 sizeof(MasterPacketUART));
   }
 }
 
 // --- FDCAN RECEIVE EVENT ---
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
+                               uint32_t RxFifo0ITs) {
   if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
 
     // Pull the frame out of the hardware FIFO
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader, can_rx_data) == HAL_OK) {
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader,
+                               can_rx_data) == HAL_OK) {
 
       // Cast the raw bytes into our new MasterPacket
       MasterPacket *packet = (MasterPacket *)can_rx_data;
@@ -895,11 +930,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state
    */
@@ -910,14 +944,13 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
