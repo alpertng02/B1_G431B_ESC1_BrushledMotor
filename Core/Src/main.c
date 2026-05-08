@@ -116,10 +116,20 @@ typedef struct {
 } ESC_Context_t;
 
 #pragma pack(push, 1)
-typedef struct {
-  float target_speed; // 4 Bytes (-100.0 to 100.0)
 
-  uint32_t config_change : 1;
+typedef enum {
+  PAYLOAD_TYPE_COMMAND = 0x01,
+  PAYLOAD_TYPE_CONFIG = 0x02,
+  PAYLOAD_TYPE_FEEDBACK = 0x03
+} PayloadTypes;
+
+// --- PAYLOAD 1: The High-Frequency Command ---
+typedef struct {
+  float target_speed;
+} PayloadCommand;
+
+// --- PAYLOAD 2: The Low-Frequency Config ---
+typedef struct {
   uint32_t enable_running_mode : 1;
   uint32_t enable_encoder : 1;
   uint32_t enable_overcurrent_protection : 1;
@@ -127,15 +137,34 @@ typedef struct {
   uint32_t enable_voltage_protection : 1;
   uint32_t overcurrent_threshold_amps : 6;
   uint32_t battery_cell_count : 4;
-  //
-} ControlPacket;
-#pragma pack(pop)
+  uint32_t temperature_threshold_c : 7;
+  uint32_t max_dutycycle : 7;
+} PayloadConfig;
 
-#pragma pack(push, 1)
+// --- PAYLOAD 3: Telemetry Feedback ---
 typedef struct {
-  uint16_t header; // 2 Bytes
-  ControlPacket packet;
-} ControlPacketUART;
+  int8_t dutycycle;
+  int8_t temperature_c;
+  int16_t shunt_u;
+  int16_t shunt_v;
+} PayloadFeedback;
+
+// --- THE MASTER PACKET ---
+typedef struct {
+  uint8_t msg_type; // This tells the STM32 how to read the union
+  union {
+    PayloadCommand command;
+    PayloadConfig config;
+    PayloadFeedback feedback;
+  } payload;
+} MasterPacket;
+
+// --- UART WRAPPER ---
+typedef struct {
+  uint16_t header; // 0x726F
+  MasterPacket packet;
+} MasterPacketUART;
+
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -206,7 +235,7 @@ volatile uint32_t adc1_buffer[4];
 volatile uint32_t adc2_buffer[4];
 
 // Communication Buffers
-static uint8_t uart_rx_buffer[sizeof(ControlPacketUART)];
+static uint8_t uart_rx_buffer[sizeof(MasterPacketUART)];
 
 FDCAN_RxHeaderTypeDef CanRxHeader;
 static uint8_t can_rx_data[64];
@@ -792,63 +821,72 @@ float get_rc_pwm_target_speed(uint32_t ch_ticks) {
   return target;
 }
 
-float handle_control_packet(ESC_Context_t *esc, const ControlPacket *packet) {
+// --- THE NEW PACKET ROUTER ---
+void process_master_packet(ESC_Context_t *esc, const MasterPacket *packet, ESC_InputMode source) {
+  
+  switch (packet->msg_type) {
+      
+    case PAYLOAD_TYPE_COMMAND:
+      // Update the speed based on who sent it
+      if (source == ESC_INPUT_MODE_UART) {
+          esc->control.raw_uart_input = packet->payload.command.target_speed;
+          esc->control.last_uart_cmd_ms = current_time_ms; // Reset watchdog!
+      } else if (source == ESC_INPUT_MODE_CAN) {
+          esc->control.raw_can_input = packet->payload.command.target_speed;
+          esc->control.last_can_cmd_ms = current_time_ms; // Reset watchdog!
+      }
+      break;
 
-  if (packet->config_change) {
-    esc->protection.battery_cell_count = packet->battery_cell_count;
-    esc->protection.overtemperature_protection_on =
-        packet->enable_overtemperature_protection;
-    esc->protection.voltage_protection_on = packet->enable_voltage_protection;
-    esc->protection.overcurrent_protection_on = packet->enable_overcurrent_protection;
-    esc->protection.current_threshold_amps = packet->overcurrent_threshold_amps;
+    case PAYLOAD_TYPE_CONFIG:
+      // Update hardware protections
+      esc->protection.battery_cell_count = packet->payload.config.battery_cell_count;
+      esc->protection.overtemperature_protection_on = packet->payload.config.enable_overtemperature_protection;
+      esc->protection.voltage_protection_on = packet->payload.config.enable_voltage_protection;
+      esc->protection.overcurrent_protection_on = packet->payload.config.enable_overcurrent_protection;
+      esc->protection.current_threshold_amps = packet->payload.config.overcurrent_threshold_amps;
+      
+      // We don't have access to offset_u / offset_v directly here since they are static vars,
+      // but assuming they are accessible globally in your setup:
+      set_overcurrent_protection_threshold(esc->protection.current_threshold_amps, offset_u, offset_v);
+      
+      // Notice we DO NOT reset the watchdog timer here! 
+      // A configuration update shouldn't keep the motor spinning.
+      break;
 
-    set_overcurrent_protection_threshold(esc->protection.current_threshold_amps,
-                                         offset_u, offset_v);
+    default:
+      // Unknown packet type (or Feedback packet received by mistake), ignore it
+      break;
   }
-  return packet->target_speed;
 }
 
 // --- UART RECEIVE EVENT ---
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
   if (huart->Instance == USART2) {
-    // Check against the UART wrapper
-    if (Size == sizeof(ControlPacketUART)) {
-      ControlPacketUART *uart_msg = (ControlPacketUART *)uart_rx_buffer;
+    // Check against the new Master UART wrapper size
+    if (Size == sizeof(MasterPacketUART)) {
+      MasterPacketUART *uart_msg = (MasterPacketUART *)uart_rx_buffer;
 
-      // Verify data integrity using your new macros
+      // Verify data integrity
       if (uart_msg->header == UART_HEADER_BYTES) {
-
-        esc_system.control.raw_uart_input =
-            handle_control_packet(&esc_system, &(uart_msg->packet));
-
-        // Reset the UART watchdog!
-        esc_system.control.last_uart_cmd_ms = current_time_ms;
+        process_master_packet(&esc_system, &(uart_msg->packet), ESC_INPUT_MODE_UART);
       }
     }
     // Instantly restart the DMA to listen for the next packet
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer,
-                                 sizeof(ControlPacketUART));
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer, sizeof(MasterPacketUART));
   }
 }
+
 // --- FDCAN RECEIVE EVENT ---
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
-                               uint32_t RxFifo0ITs) {
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
   if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
 
     // Pull the frame out of the hardware FIFO
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader,
-                               can_rx_data) == HAL_OK) {
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader, can_rx_data) == HAL_OK) {
 
-      // The FDCAN DataLength is an enum (e.g., FDCAN_DLC_BYTES_12 is actually
-      // 0x00090000) As long as the sender packed at least 12 bytes, we can
-      // parse it.
-      ControlPacket *packet = (ControlPacket *)can_rx_data;
+      // Cast the raw bytes into our new MasterPacket
+      MasterPacket *packet = (MasterPacket *)can_rx_data;
 
-      esc_system.control.raw_can_input =
-          handle_control_packet(&esc_system, packet);
-
-      // Reset the CAN watchdog!
-      esc_system.control.last_can_cmd_ms = current_time_ms;
+      process_master_packet(&esc_system, packet, ESC_INPUT_MODE_CAN);
     }
   }
 }
