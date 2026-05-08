@@ -113,25 +113,11 @@ typedef struct {
   ESC_State state;
 } ESC_Context_t;
 
-typedef enum {
-  PAYLOAD_TYPE_COMMAND = 0x01,
-  PAYLOAD_TYPE_CONFIG = 0x02,
-  PAYLOAD_TYPE_FEEDBACK = 0x03
-} PayloadTypes;
+#pragma pack(push, 1)
+typedef struct {
+  float target_speed; // 4 Bytes (-100.0 to 100.0)
 
-// --- PAYLOAD 1: The High-Frequency Command ---
-typedef struct {
-  float target_speed;
-} PayloadCommand;
-typedef struct {
-  int8_t dutycycle;
-  int8_t temperature_c;
-  int16_t shunt_u;
-  int16_t shunt_v;
-} PayloadFeedback;
-
-// --- PAYLOAD 2: The Low-Frequency Config ---
-typedef struct {
+  uint32_t config_change : 1;
   uint32_t enable_running_mode : 1;
   uint32_t enable_encoder : 1;
   uint32_t enable_overcurrent_protection : 1;
@@ -139,25 +125,15 @@ typedef struct {
   uint32_t enable_voltage_protection : 1;
   uint32_t overcurrent_threshold_amps : 6;
   uint32_t battery_cell_count : 4;
-  uint32_t temperature_threshold_c : 7;
-  uint32_t max_dutycycle : 7;
-} PayloadConfig;
+  //
+} ControlPacket;
+#pragma pack(pop)
 
-// --- THE MASTER PACKET ---
+#pragma pack(push, 1)
 typedef struct {
-  uint8_t msg_type; // This tells the STM32 how to read the union
-  union {
-    PayloadCommand command;
-    PayloadConfig config;
-  } payload;
-} MasterPacket;
-
-// --- UART WRAPPER ---
-typedef struct {
-  uint16_t header; // 0x726F
-  MasterPacket packet;
-} MasterPacketUART;
-
+  uint16_t header; // 2 Bytes
+  ControlPacket packet;
+} ControlPacketUART;
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -824,8 +800,7 @@ float handle_control_packet(ESC_Context_t *esc, const ControlPacket *packet) {
     esc->protection.overtemperature_protection_on =
         packet->enable_overtemperature_protection;
     esc->protection.voltage_protection_on = packet->enable_voltage_protection;
-    esc->protection.overcurrent_protection_on =
-        packet->enable_overcurrent_protection;
+    esc->protection.overcurrent_protection_on = packet->enable_overcurrent_protection;
     esc->protection.current_threshold_amps = packet->overcurrent_threshold_amps;
 
     set_overcurrent_protection_threshold(esc->protection.current_threshold_amps,
