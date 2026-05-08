@@ -246,11 +246,11 @@ float biquad_state_current[4];
 
 // Order: { b0, b1, b2, a1, a2 }
 const float biquad_coeffs[5] = {
-    0.000241358998f, // b0 (zeros[0])
-    0.000482717997f, // b1 (zeros[1])
-    0.000241358998f, // b2 (zeros[2])
-    1.955577832819f, // a1 (poles[1] * -1)
-    -0.956543268814f // a2 (poles[2] * -1)
+    0.04125344110097427f, // b0 (zeros[0])
+    0.08250688220194854f, // b1 (zeros[1])
+    0.04125344110097427f, // b2 (zeros[2])
+    1.34896460150382f, // a1 (poles[1] * -1)
+    -0.5139783659077168f // a2 (poles[2] * -1)
 };
 volatile float active_motor_current_mA = 0.0f;
 
