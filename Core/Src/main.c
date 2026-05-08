@@ -65,6 +65,7 @@ typedef struct {
   float ki;
   float integral_error;
   float output_limit;
+  float epsilon;
 } PI_Controller_t;
 
 typedef struct {
@@ -79,6 +80,9 @@ typedef struct {
 
 typedef struct {
   MotorControlMode active_control_mode; // Duty, Current, or Velocity
+
+  float target_speed;  // The raw input before routing
+  float current_speed; // The actual motor RPM (from encoder)
 
   float target_dutycycle; // -100.0 to 100.0 %
   float target_current_A; // e.g., -10.0 to 10.0 Amps
@@ -217,6 +221,9 @@ typedef struct {
 #define OVERTEMPERATURE_PROTECTION_THRESHOLD_CELCIUS (80.0f)
 #define OVERCURRENT_PROTECTION_THRESHOLD_AMPS (20.0f)
 
+#define CURRENT_PID_EPSILON (0.1f)
+#define VELOCITY_PID_EPSILON (0.0f)
+
 #define OVERCURRENT_PROTECTION_TIMEOUT_MS (2000)
 #define OVERTEMPERATURE_PROTECTION_TIMEOUT_MS (5000)
 #define VOLTAGE_PROTECTION_TIMEOUT_MS (2000)
@@ -257,7 +264,7 @@ FDCAN_RxHeaderTypeDef CanRxHeader;
 static uint8_t can_rx_data[64];
 
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
-volatile static uint64_t current_time_ms = 0;
+volatile static uint32_t current_time_ms = 0;
 
 // --- CMSIS-DSP BIQUAD FILTER VARS (PHASE U) ---
 arm_biquad_casd_df1_inst_f32 biquad_filter_current;
@@ -300,17 +307,23 @@ void MotorControl_Update(ESC_Context_t *ctx, uint32_t current_time_ms);
 void MotorState_Update(ESC_Context_t *ctx);
 
 // Initializes a PI controller
-void PI_Init(PI_Controller_t *pi, float kp, float ki, float limit) {
+void PI_Init(PI_Controller_t *pi, float kp, float ki, float limit,
+             float epsilon) {
   pi->kp = kp;
   pi->ki = ki;
   pi->integral_error = 0.0f;
   pi->output_limit = limit;
+  pi->epsilon = epsilon;
 }
 
 // Computes the PI algorithm
 float PI_Update(PI_Controller_t *pi, float target, float actual, float dt) {
   float error = target - actual;
 
+  // --- THE DEADBAND FILTER ---
+  if (fabsf(error) <= pi->epsilon) {
+    error = 0.0f;
+  }
   // Proportional term
   float p_term = pi->kp * error;
 
@@ -403,11 +416,12 @@ int main(void) {
                                   (float *)biquad_coeffs, biquad_state_current);
 
   // Init Current Loop (Limit output to max Duty Cycle)
-  PI_Init(&esc_system.control.current_pi, 0.5f, 0.01f, 98.0f);
+  PI_Init(&esc_system.control.current_pi, 0.5f, 0.01f, 98.0f,
+          CURRENT_PID_EPSILON);
 
   // Init Velocity Loop (Limit output to slightly below Overcurrent Threshold.
   PI_Init(&esc_system.control.velocity_pi, 0.1f, 0.001f,
-          OVERCURRENT_PROTECTION_THRESHOLD_AMPS * 0.95f);
+          OVERCURRENT_PROTECTION_THRESHOLD_AMPS * 0.95f, VELOCITY_PID_EPSILON);
 
   HAL_GPIO_WritePin(CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port,
                     CAN_TRANSCEIVER_SHUTDOWN_Pin, !CANBUS_TRANSCEIVER_ACTIVE);
@@ -566,26 +580,32 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     active_motor_current_mA = filtered_result;
 
     // ---------------------------------------------------------
-    // 5. Your 4kHz Decimator & PI Loop goes right here!
+    // 5. 4kHz Decimator & PI Loop
     // ---------------------------------------------------------
+    static uint32_t decimator_counter = 0;
+    decimator_counter++;
+    if (decimator_counter >= 5) {
+      decimator_counter = 0;
+      // dt = 1 / 4000 = 0.00025 seconds
+      if (esc_system.state == ESC_STATE_RUNNING) {
 
-    // dt = 1 / 4000 = 0.00025 seconds
-    if (esc_system.state == ESC_STATE_RUNNING) {
+        if (esc_system.control.active_control_mode == CONTROL_MODE_DUTYCYCLE) {
+          // Open Loop: Just pass the target straight to the hardware
+          set_motor_speed(esc_system.control.target_dutycycle);
 
-      if (esc_system.control.active_control_mode == CONTROL_MODE_DUTYCYCLE) {
-        // Open Loop: Just pass the target straight to the hardware
-        set_motor_speed(esc_system.control.target_dutycycle);
+        } else {
+          // Closed Loop: Run the Current PI math
+          // Note: If in Velocity mode, target_current_A was already set by
+          // TIM6!
+          float required_dutycycle =
+              PI_Update(&esc_system.control.current_pi,
+                        esc_system.control.target_current_A,
+                        (active_motor_current_mA / 1000.0f), // Convert mA to A
+                        0.00025f                             // 4kHz dt
+              );
 
-      } else {
-        // Closed Loop: Run the Current PI math
-        // Note: If in Velocity mode, target_current_A was already set by TIM6!
-        float required_dutycycle = PI_Update(
-            &esc_system.control.current_pi, esc_system.control.target_current_A,
-            (active_motor_current_mA / 1000.0f), // Convert mA to A
-            0.00025f                             // 4kHz dt
-        );
-
-        set_motor_speed(required_dutycycle);
+          set_motor_speed(required_dutycycle);
+        }
       }
     }
   }
