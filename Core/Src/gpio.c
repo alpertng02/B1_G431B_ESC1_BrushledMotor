@@ -86,6 +86,12 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(DEVBOARD_BUTTON_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : DIR_INPUT_Pin */
+  GPIO_InitStruct.Pin = DIR_INPUT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(DIR_INPUT_GPIO_Port, &GPIO_InitStruct);
+
 }
 
 /* USER CODE BEGIN 2 */

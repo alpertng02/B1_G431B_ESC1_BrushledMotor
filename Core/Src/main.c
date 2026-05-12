@@ -23,10 +23,9 @@
 #include "dac.h"
 #include "dma.h"
 #include "fdcan.h"
-#include "gpio.h"
 #include "opamp.h"
 #include "tim.h"
-#include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -356,10 +355,11 @@ float PI_Update(PI_Controller_t *pi, float target, float actual, float dt) {
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
   esc_system.state = ESC_STATE_BOOTING;
@@ -378,8 +378,7 @@ int main(void) {
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -408,7 +407,6 @@ int main(void) {
   MX_OPAMP3_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
-  MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
@@ -506,20 +504,21 @@ int main(void) {
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -529,20 +528,22 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
     Error_Handler();
   }
 }
@@ -607,19 +608,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
           set_motor_speed(required_dutycycle);
         }
       }
-    }
-  }
-}
-
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM2) {
-    uint32_t cl = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-    uint32_t ch = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-
-    if (cl > 0) {
-      // Feed the raw value into the struct and reset the watchdog timer!
-      esc_system.control.raw_pwm_input = get_rc_pwm_target_speed(ch);
-      esc_system.control.last_pwm_cmd_ms = current_time_ms;
     }
   }
 }
@@ -710,6 +698,38 @@ void FaultMonitor_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
 }
 
 void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
+  
+  // --- 0. HARDWARE PWM & DIR POLLING ---
+  uint32_t current_count = TIM2->CNT;
+  uint32_t period = TIM2->CCR1;
+  uint32_t pulse_width = TIM2->CCR2;
+  bool is_forward = (GPIOB->IDR & GPIO_IDR_ID7) != 0;
+
+  if (period > 0) {
+    // Check for hardware timeout (Stuck at 0%, 100%, or disconnected)
+    if (current_count > (period * 2)) {
+      
+      // Check PA5 (TIM2_CH1 input pin on the G431 ESC)
+      if ((GPIOA->IDR & GPIO_IDR_ID5) != 0) {
+        // Signal is stuck High -> 100% Duty Cycle
+        esc->control.raw_pwm_input = is_forward ? 100.0f : -100.0f;
+        esc->control.last_pwm_cmd_ms = current_time_ms; // Feed the watchdog
+      } else {
+        // Signal is stuck Low or disconnected -> 0% Duty Cycle
+        // Notice we DO NOT feed the watchdog here. This allows your auto-detect 
+        // router to fall back to UART or CAN if the PWM cable is unplugged.
+        esc->control.raw_pwm_input = 0.0f; 
+      }
+      
+    } else {
+      // Signal is actively pulsing (1% to 99%)
+      float duty_cycle = ((float)pulse_width / (float)period) * 100.0f;
+      esc->control.raw_pwm_input = is_forward ? duty_cycle : -duty_cycle;
+      esc->control.last_pwm_cmd_ms = current_time_ms; // Feed the watchdog
+    }
+  }
+
+
   // --- 1. POT OVERRIDE ---
   if (esc->control.pot_override_active) {
     esc->control.active_mode = ESC_INPUT_MODE_POT;
@@ -1050,10 +1070,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state
    */
@@ -1064,13 +1085,14 @@ void Error_Handler(void) {
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
