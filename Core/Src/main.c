@@ -256,12 +256,6 @@ volatile static float bemf_w_V = 0.0f;
 volatile uint32_t adc1_buffer[4];
 volatile uint32_t adc2_buffer[4];
 
-// Communication Buffers
-static uint8_t uart_rx_buffer[sizeof(MasterPacketUART)];
-
-FDCAN_RxHeaderTypeDef CanRxHeader;
-static uint8_t can_rx_data[64];
-
 static GPIO_PinState last_devboard_button_state = GPIO_PIN_SET;
 volatile static uint32_t current_time_ms = 0;
 
@@ -287,8 +281,6 @@ void SystemClock_Config(void);
 
 void set_motor_speed(float speed_percent);
 
-void setup_serial_communication(uint32_t can_id, uint8_t *uart_rx_buf,
-                                uint16_t packet_size);
 void set_overcurrent_protection_threshold(float threshold_A,
                                           int32_t shunt_offset_u,
                                           int32_t shunt_offset_v);
@@ -473,9 +465,6 @@ int main(void)
   // Start PWM Input
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // Signal Input Channel (Main)
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);    // Secondary Channel
-
-  setup_serial_communication(FDCAN_STANDARD_ID, uart_rx_buffer,
-                             sizeof(uart_rx_buffer));
 
   esc_system.state = ESC_STATE_IDLE;
   // Start motor control timer
@@ -817,34 +806,6 @@ void MotorState_Update(ESC_Context_t *esc) {
   }
 }
 
-void setup_serial_communication(uint32_t can_id, uint8_t *uart_rx_buf,
-                                uint16_t packet_size) {
-  // ==========================================================
-  // --- FDCAN INITIALIZATION ---
-  // ==========================================================
-  FDCAN_FilterTypeDef sFilterConfig;
-  sFilterConfig.IdType = can_id;
-  sFilterConfig.FilterIndex = 0;
-  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
-  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  sFilterConfig.FilterID1 = 0x000;
-  sFilterConfig.FilterID2 = 0x000; // Mask of 0 accepts all standard IDs
-
-  HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig);
-  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
-                               FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
-
-  HAL_FDCAN_Start(&hfdcan1);
-  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-
-  // ==========================================================
-  // --- UART DMA INITIALIZATION ---
-  // ==========================================================
-  // We use ReceiveToIdle instead of standard Receive.
-  // This prevents the buffer from permanently misaligning if a byte is dropped!
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buf, packet_size);
-}
-
 /**
 * @brief Drives the brushed DC motor on OUT1 and OUT2
 
@@ -1031,41 +992,6 @@ void process_master_packet(ESC_Context_t *esc, const MasterPacket *packet,
   }
 }
 
-// --- UART RECEIVE EVENT ---
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
-  if (huart->Instance == USART2) {
-    // Check against the new Master UART wrapper size
-    if (Size == sizeof(MasterPacketUART)) {
-      MasterPacketUART *uart_msg = (MasterPacketUART *)uart_rx_buffer;
-
-      // Verify data integrity
-      if (uart_msg->header == UART_HEADER_BYTES) {
-        process_master_packet(&esc_system, &(uart_msg->packet),
-                              ESC_INPUT_MODE_UART);
-      }
-    }
-    // Instantly restart the DMA to listen for the next packet
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buffer,
-                                 sizeof(MasterPacketUART));
-  }
-}
-
-// --- FDCAN RECEIVE EVENT ---
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
-                               uint32_t RxFifo0ITs) {
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
-
-    // Pull the frame out of the hardware FIFO
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &CanRxHeader,
-                               can_rx_data) == HAL_OK) {
-
-      // Cast the raw bytes into our new MasterPacket
-      MasterPacket *packet = (MasterPacket *)can_rx_data;
-
-      process_master_packet(&esc_system, packet, ESC_INPUT_MODE_CAN);
-    }
-  }
-}
 
 /* USER CODE END 4 */
 
