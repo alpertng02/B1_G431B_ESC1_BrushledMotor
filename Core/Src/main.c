@@ -692,21 +692,21 @@ void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
   uint32_t current_count = TIM2->CNT;
   uint32_t period = TIM2->CCR1;
   uint32_t pulse_width = TIM2->CCR2;
-  bool is_forward = (GPIOB->IDR & GPIO_IDR_ID7) != 0;
+  
+  // FIX: Use standard HAL to read the DIR pin (Assuming PB7)
+  bool is_forward = (HAL_GPIO_ReadPin(DIR_PIN_GPIO_Port, DIR_PIN_Pin) == GPIO_PIN_SET);
 
   if (period > 0) {
     // Check for hardware timeout (Stuck at 0%, 100%, or disconnected)
     if (current_count > (period * 2)) {
       
-      // Check PA5 (TIM2_CH1 input pin on the G431 ESC)
-      if ((GPIOA->IDR & GPIO_IDR_ID5) != 0) {
+      // FIX: Check PA15 (The actual TIM2_CH1 PWM input pin on the G431 ESC)
+      if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) {
         // Signal is stuck High -> 100% Duty Cycle
         esc->control.raw_pwm_input = is_forward ? 100.0f : -100.0f;
         esc->control.last_pwm_cmd_ms = current_time_ms; // Feed the watchdog
       } else {
         // Signal is stuck Low or disconnected -> 0% Duty Cycle
-        // Notice we DO NOT feed the watchdog here. This allows your auto-detect 
-        // router to fall back to UART or CAN if the PWM cable is unplugged.
         esc->control.raw_pwm_input = 0.0f; 
       }
       
@@ -717,6 +717,8 @@ void MotorControl_Update(ESC_Context_t *esc, uint32_t current_time_ms) {
       esc->control.last_pwm_cmd_ms = current_time_ms; // Feed the watchdog
     }
   }
+
+  // ... (rest of the routing logic remains unchanged)
 
 
   // --- 1. POT OVERRIDE ---

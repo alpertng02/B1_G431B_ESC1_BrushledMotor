@@ -99,8 +99,8 @@ void Error_Handler(void);
 #define DEVBOARD_BUTTON_GPIO_Port GPIOC
 #define CAN_TRANSCEIVER_SHUTDOWN_Pin GPIO_PIN_11
 #define CAN_TRANSCEIVER_SHUTDOWN_GPIO_Port GPIOC
-#define DIR_INPUT_Pin GPIO_PIN_7
-#define DIR_INPUT_GPIO_Port GPIOB
+#define DIR_PIN_Pin GPIO_PIN_4
+#define DIR_PIN_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
